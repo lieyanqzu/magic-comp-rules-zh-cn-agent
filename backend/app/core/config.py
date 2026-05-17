@@ -21,8 +21,12 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4o"
     openai_base_url: str = "https://api.openai.com/v1"
-    embedding_model: str = "text-embedding-3-small"
-    mtgch_api_url: str = "https://api.mtgch.com"
+
+    # Embedding 配置（可独立于 chat API）
+    embedding_api_key: str = ""
+    embedding_base_url: str = ""
+    embedding_model: str = "BAAI/bge-m3"
+    mtgch_api_url: str = "https://mtgch.com/api"
     scryfall_api_url: str = "https://api.scryfall.com"
     rules_root_dir: str = ".."
 

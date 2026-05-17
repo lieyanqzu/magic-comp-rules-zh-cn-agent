@@ -88,13 +88,14 @@ async def ingest_all(generate_embeddings: bool = False) -> None:
     async with async_session_factory() as db:
         await clear_existing_chunks(db)
         for i, chunk in enumerate(all_chunks):
+            emb = embeddings[i] if embeddings and i < len(embeddings) and embeddings[i] else None
             db.add(RuleChunk(
                 document_type=chunk.document_type,
                 source_path=chunk.source_path,
                 section_id=chunk.section_id,
                 title=chunk.title,
                 content=chunk.content,
-                embedding=embeddings[i] if embeddings else None,
+                embedding=emb,
                 metadata_=chunk.metadata,
             ))
         await db.commit()
