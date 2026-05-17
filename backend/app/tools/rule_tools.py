@@ -24,33 +24,33 @@ async def search_by_section_id(db: AsyncSession, section_id: str, document_types
     return list(result.scalars().all())
 
 
-async def search_by_keyword(db: AsyncSession, keyword: str, document_types: list[str] | None = None, limit: int = 10) -> list[RuleChunk]:
-    """关键词检索：拆分多个关键词分别搜索，合并去重，按匹配数排序。"""
+async def search_by_keyword(
+    db: AsyncSession, keyword: str, document_types: list[str] | None = None, limit: int = 10
+) -> list[RuleChunk]:
+    """关键词检索：拆分关键词，单次查询合并 OR 条件，按匹配数排序。"""
     keywords = [kw.strip() for kw in re.split(r"[\s,，、;；]+", keyword) if len(kw.strip()) >= 1]
     if not keywords:
         return []
 
-    seen_ids: set[int] = set()
-    results: list[RuleChunk] = []
-
+    # 构建 OR 条件：任意关键词命中 title 或 content 即匹配
+    conditions = []
     for kw in keywords:
-        search_term = f"%{kw}%"
-        query = select(RuleChunk).where(
-            or_(RuleChunk.title.ilike(search_term), RuleChunk.content.ilike(search_term))
-        )
-        if document_types:
-            query = query.where(RuleChunk.document_type.in_(document_types))
-        query = query.limit(limit)
+        term = f"%{kw}%"
+        conditions.append(RuleChunk.title.ilike(term))
+        conditions.append(RuleChunk.content.ilike(term))
 
-        rows = await db.execute(query)
-        for chunk in rows.scalars().all():
-            if chunk.id not in seen_ids:
-                results.append(chunk)
-                seen_ids.add(chunk.id)
+    query = select(RuleChunk).where(or_(*conditions))
+    if document_types:
+        query = query.where(RuleChunk.document_type.in_(document_types))
+    query = query.limit(limit * 3)  # 多取一些，排序后截断
 
+    result = await db.execute(query)
+    chunks = list(result.scalars().all())
+
+    # 按匹配关键词数降序排序
     def _match_count(chunk: RuleChunk) -> int:
         text = f"{chunk.title} {chunk.content}"
         return sum(1 for kw in keywords if kw in text)
 
-    results.sort(key=_match_count, reverse=True)
-    return results[:limit]
+    chunks.sort(key=_match_count, reverse=True)
+    return chunks[:limit]

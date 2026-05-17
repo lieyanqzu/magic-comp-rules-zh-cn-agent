@@ -18,6 +18,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     op.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    op.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
 
     op.create_table(
         'rule_chunks',
@@ -36,6 +37,8 @@ def upgrade() -> None:
     op.create_index('ix_rule_chunks_section_id', 'rule_chunks', ['section_id'])
     op.create_index('ix_rule_chunks_document_type', 'rule_chunks', ['document_type'])
     op.execute("CREATE INDEX ix_rule_chunks_embedding ON rule_chunks USING hnsw (embedding vector_cosine_ops)")
+    op.execute("CREATE INDEX ix_rule_chunks_title_trgm ON rule_chunks USING gin (title gin_trgm_ops)")
+    op.execute("CREATE INDEX ix_rule_chunks_content_trgm ON rule_chunks USING gin (content gin_trgm_ops)")
 
     op.create_table(
         'card_cache',

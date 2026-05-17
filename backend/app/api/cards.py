@@ -1,6 +1,6 @@
 """牌张查询接口。"""
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,9 +23,18 @@ class CardResolveResponse(BaseModel):
 
 
 @router.post("/resolve", response_model=CardResolveResponse)
-async def resolve_card(request: CardResolveRequest, db: AsyncSession = Depends(get_db)) -> CardResolveResponse:
-    service = CardService(db)
+async def resolve_card(
+    request: CardResolveRequest,
+    req: Request,
+    db: AsyncSession = Depends(get_db),
+) -> CardResolveResponse:
+    redis = getattr(req.app.state, "redis", None)
+    service = CardService(db, redis=redis)
     card_info = await service.resolve_and_get(request.name)
     if card_info is None:
-        return CardResolveResponse(card=CardInfo(input_name=request.name), found=False, message=f"未找到牌张：{request.name}")
+        return CardResolveResponse(
+            card=CardInfo(input_name=request.name),
+            found=False,
+            message=f"未找到牌张：{request.name}",
+        )
     return CardResolveResponse(card=card_info, found=True)
