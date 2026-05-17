@@ -175,12 +175,6 @@ async def resolve_card_name(input_name: str) -> dict | None:
     return result
 
 
-async def get_oracle_text(card_name: str) -> str | None:
-    """获取牌张的 Oracle 文本（英文）。"""
-    result = await resolve_card_name(card_name)
-    return result.get("oracle_text") if result else None
-
-
 async def search_cards(query: str, page: int = 1) -> dict | None:
     """按条件搜索牌库。
 
