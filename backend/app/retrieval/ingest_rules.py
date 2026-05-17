@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from sqlalchemy import delete
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.logging import get_logger, setup_logging
@@ -39,9 +40,7 @@ async def ensure_tables() -> None:
         await conn.run_sync(Base.metadata.create_all)
 
 
-async def clear_existing_chunks(db: object) -> None:
-    from sqlalchemy.ext.asyncio import AsyncSession
-    assert isinstance(db, AsyncSession)
+async def clear_existing_chunks(db: AsyncSession) -> None:
     await db.execute(delete(RuleChunk))
     await db.commit()
     logger.info("已清空旧的规则切片数据")

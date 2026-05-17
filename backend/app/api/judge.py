@@ -12,11 +12,29 @@ from app.agent.schemas import JudgeRequest, JudgeResponse
 from app.core.auth import verify_api_key
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.db.session import get_db
+from app.db.session import async_session_factory, get_db
 from app.db.models import JudgeQuery
 
 router = APIRouter(dependencies=[Depends(verify_api_key)])
 logger = get_logger(__name__)
+
+
+async def _log_query(question: str, response: JudgeResponse, elapsed_ms: float) -> None:
+    """记录问答日志，失败不影响返回。"""
+    try:
+        async with async_session_factory() as db:
+            db.add(JudgeQuery(
+                question=question, answer=response.answer,
+                model=settings.openai_model, confidence=response.confidence,
+                used_rules=[r.model_dump() for r in response.rules],
+                used_cards=[c.model_dump() for c in response.cards],
+                latency_ms=elapsed_ms,
+                reasoning_summary=response.reasoning_summary,
+                needs_human_judge=response.needs_human_judge,
+            ))
+            await db.commit()
+    except Exception:
+        logger.warning("问答日志写入失败", question=question[:50])
 
 
 @router.post("/ask", response_model=JudgeResponse)
@@ -25,24 +43,15 @@ async def ask_judge(request: JudgeRequest, db: AsyncSession = Depends(get_db)) -
     start = time.monotonic()
     agent = JudgeAgent()
     response = await agent.ask(question=request.question, language=request.language)
-    response.latency_ms = round((time.monotonic() - start) * 1000, 1)
+    elapsed = round((time.monotonic() - start) * 1000, 1)
+    response.latency_ms = elapsed
 
-    # 记录日志
-    db.add(JudgeQuery(
-        question=request.question, answer=response.answer,
-        model=settings.openai_model, confidence=response.confidence,
-        used_rules=[r.model_dump() for r in response.rules],
-        used_cards=[c.model_dump() for c in response.cards],
-        latency_ms=response.latency_ms,
-        reasoning_summary=response.reasoning_summary,
-        needs_human_judge=response.needs_human_judge,
-    ))
-    await db.commit()
+    await _log_query(request.question, response, elapsed)
     return response
 
 
 @router.post("/stream")
-async def stream_judge(request: JudgeRequest, db: AsyncSession = Depends(get_db)) -> StreamingResponse:
+async def stream_judge(request: JudgeRequest) -> StreamingResponse:
     """流式接口（SSE），逐步返回推理过程和工具调用。"""
     agent = JudgeAgent()
 
@@ -50,33 +59,28 @@ async def stream_judge(request: JudgeRequest, db: AsyncSession = Depends(get_db)
         start = time.monotonic()
         final_response = None
 
-        async for event in agent.ask_stream(question=request.question, language=request.language):
-            # 发送 SSE 事件
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-
-            # 保存最终回答
-            if event["type"] == "answer":
-                final_response = event["data"]
-            elif event["type"] == "error":
-                yield f"data: {json.dumps({'type': 'done', 'error': event['content']}, ensure_ascii=False)}\n\n"
-                return
+        try:
+            async for event in agent.ask_stream(question=request.question, language=request.language):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                if event["type"] == "answer":
+                    final_response = event["data"]
+                elif event["type"] == "error":
+                    yield f"data: {json.dumps({'type': 'done', 'error': event['content']}, ensure_ascii=False)}\n\n"
+                    return
+        except Exception as e:
+            logger.exception("流式回答异常")
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
+            return
 
         elapsed = round((time.monotonic() - start) * 1000, 1)
 
-        # 记录日志
         if final_response:
-            db.add(JudgeQuery(
-                question=request.question,
-                answer=final_response.get("answer", ""),
-                model=settings.openai_model,
-                confidence=final_response.get("confidence", "medium"),
-                used_rules=final_response.get("rules", []),
-                used_cards=final_response.get("cards", []),
-                latency_ms=elapsed,
-                reasoning_summary=final_response.get("reasoning_summary", ""),
-                needs_human_judge=final_response.get("needs_human_judge", False),
-            ))
-            await db.commit()
+            try:
+                resp = JudgeResponse(**final_response)
+                resp.latency_ms = elapsed
+                await _log_query(request.question, resp, elapsed)
+            except Exception:
+                logger.warning("流式日志写入失败")
 
         yield f"data: {json.dumps({'type': 'done', 'latency_ms': elapsed}, ensure_ascii=False)}\n\n"
 

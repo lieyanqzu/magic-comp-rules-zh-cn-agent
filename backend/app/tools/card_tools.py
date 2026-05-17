@@ -9,7 +9,6 @@ from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 REQUEST_TIMEOUT = 15.0
-MTGCH_BASE = "https://mtgch.com/api/v1"
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
@@ -22,7 +21,7 @@ async def _get(url: str, params: dict | None = None) -> dict | list | None:
     """通用 GET 请求，返回 JSON 或 None。"""
     try:
         async with httpx.AsyncClient(
-            timeout=REQUEST_TIMEOUT, follow_redirects=True, verify=False,
+            timeout=REQUEST_TIMEOUT, follow_redirects=True,
             headers={"User-Agent": "mtg-judge-api/0.1"},
         ) as client:
             resp = await client.get(url, params=params)
@@ -37,7 +36,7 @@ async def _get(url: str, params: dict | None = None) -> dict | list | None:
 
 async def search_mtgch(name: str) -> dict | None:
     """通过 mtgch 搜索 API 查牌。"""
-    data = await _get(f"{MTGCH_BASE}/result", {"q": name, "page": 1})
+    data = await _get(f"{settings.mtgch_api_url}/result", {"q": name, "page": 1})
     if not data or not isinstance(data, dict):
         return None
     items = data.get("items", [])
@@ -52,7 +51,7 @@ async def search_mtgch(name: str) -> dict | None:
 
 async def get_card_detail(set_code: str, collector_number: str) -> dict | None:
     """通过 mtgch 获取牌张完整详情（view=2，含中文 Oracle、双面、FAQ）。"""
-    return await _get(f"{MTGCH_BASE}/card/{set_code}/{collector_number}/", {"view": 2})
+    return await _get(f"{settings.mtgch_api_url}/card/{set_code}/{collector_number}/", {"view": 2})
 
 
 def _parse_pt(pt_str: str) -> tuple[str | None, str | None, str | None]:
@@ -190,7 +189,7 @@ async def search_cards(query: str, page: int = 1) -> dict | None:
 
     返回 {count, items: [{name, face_name, set, collector_number, ...}]}
     """
-    data = await _get(f"{MTGCH_BASE}/result", {"q": query, "page": page})
+    data = await _get(f"{settings.mtgch_api_url}/result", {"q": query, "page": page})
     if not data or not isinstance(data, dict):
         return None
 

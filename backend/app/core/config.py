@@ -26,8 +26,7 @@ class Settings(BaseSettings):
     embedding_api_key: str = ""
     embedding_base_url: str = ""
     embedding_model: str = "BAAI/bge-m3"
-    mtgch_api_url: str = "https://mtgch.com/api"
-    scryfall_api_url: str = "https://api.scryfall.com"
+    mtgch_api_url: str = "https://mtgch.com/api/v1"
     rules_root_dir: str = ".."
 
     # 安全配置

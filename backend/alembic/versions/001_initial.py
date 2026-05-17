@@ -23,11 +23,11 @@ def upgrade() -> None:
         'rule_chunks',
         sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
         sa.Column('document_type', sa.String(32), nullable=False),
-        sa.Column('source_path', sa.String(512), nullable=False),
+        sa.Column('source_path', sa.Text(), nullable=False),
         sa.Column('section_id', sa.String(128), nullable=False),
-        sa.Column('title', sa.String(512), nullable=False),
+        sa.Column('title', sa.Text(), nullable=False),
         sa.Column('content', sa.Text(), nullable=False),
-        sa.Column('embedding', Vector(1536), nullable=True),
+        sa.Column('embedding', Vector(1024), nullable=True),
         sa.Column('metadata', sa.JSON(), nullable=True),
         sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.func.now()),
@@ -35,6 +35,7 @@ def upgrade() -> None:
     )
     op.create_index('ix_rule_chunks_section_id', 'rule_chunks', ['section_id'])
     op.create_index('ix_rule_chunks_document_type', 'rule_chunks', ['document_type'])
+    op.execute("CREATE INDEX ix_rule_chunks_embedding ON rule_chunks USING hnsw (embedding vector_cosine_ops)")
 
     op.create_table(
         'card_cache',
@@ -69,6 +70,8 @@ def upgrade() -> None:
         sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.PrimaryKeyConstraint('id'),
     )
+    op.create_index('ix_judge_queries_created_at', 'judge_queries', ['created_at'])
+    op.create_index('ix_judge_queries_needs_human_judge', 'judge_queries', ['needs_human_judge'])
 
 
 def downgrade() -> None:

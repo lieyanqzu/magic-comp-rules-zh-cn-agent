@@ -2,23 +2,7 @@
 
 from pydantic import BaseModel, Field
 
-
-class CardFace(BaseModel):
-    """双面牌的单面信息。"""
-    face_name: str = ""
-    oracle_text: str = ""
-    translated_text: str = ""
-    translated_type: str = ""
-    mana_cost: str = ""
-    power: str | None = None
-    toughness: str | None = None
-    defense: str | None = None
-
-
-class CardRuling(BaseModel):
-    """FAQ/ruling 条目。"""
-    date: str = ""
-    text: str = ""
+from app.schemas import CardFace, CardRuling
 
 
 class CardRef(BaseModel):

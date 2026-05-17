@@ -4,6 +4,7 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+import httpx
 from openai import AsyncOpenAI
 
 from app.agent.schemas import CardRef, JudgeResponse, RuleRef
@@ -77,7 +78,11 @@ def _event(event_type: str, **data: object) -> dict:
 
 class JudgeAgent:
     def __init__(self) -> None:
-        self.client = AsyncOpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url)
+        self.client = AsyncOpenAI(
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url,
+            timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10),
+        )
         self.system_prompt = _load_system_prompt()
         self._original_question: str = ""
 

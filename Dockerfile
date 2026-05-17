@@ -16,6 +16,14 @@ COPY backend/ backend/
 COPY skill/ skill/
 COPY magic-comp-rules-zh-cn/ magic-comp-rules-zh-cn/
 
+# 复制 entrypoint
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
+# 非 root 用户
+RUN useradd -m -r appuser && chown -R appuser:appuser /app
+USER appuser
+
 # 设置环境变量
 ENV PATH="/app/backend/.venv/bin:$PATH"
 ENV PYTHONPATH="/app/backend"
@@ -25,4 +33,8 @@ WORKDIR /app/backend
 
 EXPOSE 8000
 
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
