@@ -18,9 +18,9 @@ class RuleChunk(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     document_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    source_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    source_path: Mapped[str] = mapped_column(Text, nullable=False)
     section_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    title: Mapped[str] = mapped_column(String(512), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[list[float] | None] = mapped_column(Vector(1536), nullable=True)
     metadata_: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSONB, nullable=True)

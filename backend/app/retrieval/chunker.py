@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
-_RULE_NUMBER_RE = re.compile(r"^(\d{3}(?:\.\d+[a-z]?)?)\s*[.．。]?\s*(.+)$")
+# 匹配纯文本规则编号（如 100.1a）和 HTML 包裹的规则编号（如 <b id='cr100-1a'>100.1a</b>）
+_RULE_NUMBER_RE = re.compile(
+    r"^(?:<b[^>]*>)?(\d{3}(?:\.\d+[a-z]?)?)(?:\.</b>|</b>)?\s*(.+)$"
+)
+# 清理残留的 HTML 标签
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
 
 
@@ -20,6 +25,11 @@ class Chunk:
     metadata: dict | None = None
 
 
+def _clean_html(text: str) -> str:
+    """移除 HTML 标签。"""
+    return _HTML_TAG_RE.sub("", text).strip()
+
+
 def chunk_cr_file(content: str, source_path: str) -> list[Chunk]:
     chunks: list[Chunk] = []
     current_section_id = ""
@@ -28,7 +38,13 @@ def chunk_cr_file(content: str, source_path: str) -> list[Chunk]:
 
     def _flush() -> None:
         if current_section_id and current_lines:
-            chunks.append(Chunk(section_id=current_section_id, title=current_title, content="\n".join(current_lines).strip(), document_type="cr", source_path=source_path))
+            chunks.append(Chunk(
+                section_id=current_section_id,
+                title=_clean_html(current_title),
+                content="\n".join(current_lines).strip(),
+                document_type="cr",
+                source_path=source_path,
+            ))
 
     for line in content.splitlines():
         match = _RULE_NUMBER_RE.match(line.strip())

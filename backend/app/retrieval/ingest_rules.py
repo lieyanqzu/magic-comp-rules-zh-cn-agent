@@ -33,7 +33,7 @@ GLOSSARY_FILES = {"glossary.md", "glossarycn.md"}
 
 
 async def ensure_tables() -> None:
-    async with engine.begin() -> conn:
+    async with engine.begin() as conn:
         import sqlalchemy
         await conn.execute(sqlalchemy.text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
