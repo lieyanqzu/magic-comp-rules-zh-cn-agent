@@ -26,7 +26,7 @@ description: "万智牌中文规则裁判助手。用于回答万智牌规则问
 2. **查证中文牌名** → 通过 mtgch API 确认准确官方中文名称
 3. **查询牌面异能** → 通过 Scryfall 获取完整英文异能文本
 4. **查专题参考** → 根据问题类型，阅读 `references/` 下的对应文档
-5. **定位详细规则** → 使用 Grep 在 `markdown/` 规则文件中查找具体条文
+5. **定位详细规则** → 使用 Grep 在 `../magic-comp-rules-zh-cn/markdown/` 规则文件中查找具体条文
 6. **应用框架** → 选择适用的分析框架进行推演
 7. **给出结论** → 清晰回答，附规则依据，使用准确中文牌名
 
@@ -200,23 +200,23 @@ curl -s "https://api.scryfall.com/cards/named?fuzzy={牌名}" | head -c 5000
 ### 按规则号查找
 ```bash
 # 规则号格式: XXX.Y (如 702.19 践踏)
-grep -n "<b id='cr702-19'" markdown/7.md
+grep -n "<b id='cr702-19'" ../magic-comp-rules-zh-cn/markdown/7.md
 ```
 
 ### 按中文关键词查找
 ```bash
 # 中文词汇表（拼音排序）
-grep -B2 -A3 "践踏" markdown/glossarycn.md
+grep -B2 -A3 "践踏" ../magic-comp-rules-zh-cn/markdown/glossarycn.md
 
 # 或直接搜索关键字
-grep -n "span id=cr702" markdown/7.md | grep 践踏
+grep -n "span id=cr702" ../magic-comp-rules-zh-cn/markdown/7.md | grep 践踏
 ```
 
 ---
 
 ## 完整规则文件
 
-位于 `markdown/` 目录：
+位于 `../magic-comp-rules-zh-cn/markdown/` 目录：
 
 | 文件 | 章节 | 核心内容 |
 |------|------|----------|

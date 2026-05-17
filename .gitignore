@@ -1,11 +1,11 @@
+CLAUDE.md
 /reports/
 __pycache__/
 /old/
 /new/
-/scripts/upload.sh
 /.vscode/
 /.claude/
 /.DS_Store/
 /.playwright-cli/
 # 测试文件夹 - 文章翻译工具测试用
-/article-translator/articles/
+/skill/article-translator/articles/
