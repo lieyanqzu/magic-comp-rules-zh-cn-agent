@@ -9,12 +9,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.judge_agent import JudgeAgent
 from app.agent.schemas import JudgeRequest, JudgeResponse
+from app.core.auth import verify_api_key
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.session import get_db
 from app.db.models import JudgeQuery
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(verify_api_key)])
 logger = get_logger(__name__)
 
 

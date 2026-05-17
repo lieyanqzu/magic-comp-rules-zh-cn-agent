@@ -4,11 +4,12 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import verify_api_key
 from app.db.session import get_db
 from app.schemas import CardInfo
 from app.services.card_service import CardService
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(verify_api_key)])
 
 
 class CardResolveRequest(BaseModel):

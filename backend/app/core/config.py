@@ -30,6 +30,13 @@ class Settings(BaseSettings):
     scryfall_api_url: str = "https://api.scryfall.com"
     rules_root_dir: str = ".."
 
+    # 安全配置
+    api_key: str = ""  # 空则跳过认证
+    rate_limit_enabled: bool = True
+    rate_limit_requests: int = 60  # 每窗口最大请求数
+    rate_limit_window: int = 60  # 窗口秒数
+    cors_origins: str = "*"  # 逗号分隔的允许来源，* 表示全部
+
     @property
     def rules_root_path(self) -> Path:
         return Path(__file__).resolve().parent.parent.parent / self.rules_root_dir
