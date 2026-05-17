@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import AsyncIterator
+from functools import lru_cache
 from pathlib import Path
 
 import httpx
@@ -66,6 +67,7 @@ TOOLS = [
 ]
 
 
+@lru_cache(maxsize=1)
 def _load_system_prompt() -> str:
     prompt_path = Path(__file__).parent / "prompts" / "mtg_judge_zh.md"
     return prompt_path.read_text(encoding="utf-8")
@@ -84,9 +86,8 @@ class JudgeAgent:
             timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10),
         )
         self.system_prompt = _load_system_prompt()
-        self._original_question: str = ""
 
-    async def _execute_tool(self, name: str, arguments: dict) -> tuple[str, dict | None]:
+    async def _execute_tool(self, name: str, arguments: dict, original_question: str = "") -> tuple[str, dict | None]:
         """执行工具，返回 (原始结果字符串, 额外元数据)。"""
         if name == "resolve_card":
             card_name = arguments.get("card_name", "")
@@ -122,7 +123,7 @@ class JudgeAgent:
                 chunks = await hybrid_search(
                     db, query=query, section_id=section_id,
                     document_types=doc_types, top_k=10,
-                    vector_query=self._original_question,
+                    vector_query=original_question,
                 )
                 results = [{"section_id": c.section_id, "title": c.title[:100], "content": c.content[:300], "source_path": c.source_path, "document_type": c.document_type} for c in chunks]
             return json.dumps(results, ensure_ascii=False), {"query": query, "section_id": section_id, "results_count": len(results)}
@@ -136,7 +137,6 @@ class JudgeAgent:
 
     async def ask_stream(self, question: str, language: str = "zh-CN", max_tool_rounds: int = 5) -> AsyncIterator[dict]:
         """流式执行裁判问答，逐事件 yield。"""
-        self._original_question = question
         yield _event("start", question=question)
 
         rule_numbers = extract_rule_numbers(question)
@@ -187,7 +187,7 @@ class JudgeAgent:
                 yield _event("tool_call", tool=func_name, args=func_args)
 
                 try:
-                    result_str, meta = await self._execute_tool(func_name, func_args)
+                    result_str, meta = await self._execute_tool(func_name, func_args, original_question=question)
                 except Exception as e:
                     logger.warning("工具调用失败", tool=func_name, error=str(e)[:100])
                     result_str = json.dumps({"error": f"工具调用失败: {e}"}, ensure_ascii=False)

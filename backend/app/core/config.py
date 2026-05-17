@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     mtgch_api_url: str = "https://mtgch.com/api/v1"
     rules_root_dir: str = ".."
 
+    # 数据库连接池
+    db_pool_size: int = 10
+    db_max_overflow: int = 5
+
     # 安全配置
     api_key: str = ""  # 空则跳过认证
     rate_limit_enabled: bool = True

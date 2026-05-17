@@ -11,6 +11,19 @@ logger = get_logger(__name__)
 REQUEST_TIMEOUT = 15.0
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
+# 模块级 httpx 客户端，复用连接池
+_http_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT, follow_redirects=True,
+            headers={"User-Agent": "mtg-judge-api/0.1"},
+        )
+    return _http_client
+
 
 def _strip_html(text: str) -> str:
     """移除 HTML 标签。"""
@@ -20,15 +33,12 @@ def _strip_html(text: str) -> str:
 async def _get(url: str, params: dict | None = None) -> dict | list | None:
     """通用 GET 请求，返回 JSON 或 None。"""
     try:
-        async with httpx.AsyncClient(
-            timeout=REQUEST_TIMEOUT, follow_redirects=True,
-            headers={"User-Agent": "mtg-judge-api/0.1"},
-        ) as client:
-            resp = await client.get(url, params=params)
-            if resp.status_code == 404 or not resp.content:
-                return None
-            resp.raise_for_status()
-            return resp.json()
+        client = _get_client()
+        resp = await client.get(url, params=params)
+        if resp.status_code == 404 or not resp.content:
+            return None
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
         logger.warning("API 请求失败", url=url, error=str(e)[:100])
         return None
