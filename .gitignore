@@ -1,6 +1,7 @@
 CLAUDE.md
 /reports/
 __pycache__/
+*.pyc
 /old/
 /new/
 /.vscode/
@@ -9,3 +10,15 @@ __pycache__/
 /.playwright-cli/
 # 测试文件夹 - 文章翻译工具测试用
 /skill/article-translator/articles/
+# 环境变量
+.env
+backend/.env
+# Python
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+# Docker 数据卷
+pgdata/
+redisdata/

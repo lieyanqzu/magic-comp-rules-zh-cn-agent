@@ -1,0 +1,33 @@
+# 评测黄金用例
+- id: humility-mox-pearl
+  question: "如果我操控谦卑和蛋白玛珂，生物会怎样？"
+  expected_cards: ["谦卑", "蛋白玛珂"]
+  expected_rules: ["613.1", "613.4", "613.6"]
+  expected_confidence: high
+  expected_needs_human_judge: false
+
+- id: dress-down-layer
+  question: "如果场上有衰落和塔莫耶夫，衰落会让塔莫耶夫变成0/1吗？"
+  expected_cards: ["衰落", "塔莫耶夫"]
+  expected_rules: ["613.1", "613.6"]
+  expected_confidence: high
+  expected_needs_human_judge: false
+
+- id: blood-moon-urborg
+  question: "血月对厄运石窟有什么效果？"
+  expected_cards: ["血月", "厄运石窟"]
+  expected_rules: ["305.7", "613.1", "613.4"]
+  expected_confidence: high
+  expected_needs_human_judge: false
+
+- id: priority-draw-step
+  question: "在自己的抽牌阶段，优先权是什么时候获得的？"
+  expected_rules: ["116", "504"]
+  expected_confidence: high
+  expected_needs_human_judge: false
+
+- id: ipg-missed-trigger
+  question: "如果我忘记触发一个必发触发，裁判会怎么处理？"
+  expected_rules: ["ipg"]
+  expected_confidence: medium
+  expected_needs_human_judge: false
