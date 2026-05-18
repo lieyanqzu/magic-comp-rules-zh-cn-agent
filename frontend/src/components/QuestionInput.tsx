@@ -12,7 +12,7 @@ interface QuestionInputProps {
 }
 
 const PLACEHOLDER =
-  '提一个万智牌规则问题。输入 [[ 唤起牌名补全，比如 [[谦卑、[[蛋白玛珂'
+  '提一个万智牌规则问题。输入 [[ 唤起牌名补全'
 
 /**
  * 解析触发：从 caret 往前找最近的 [[，且其后到 caret 之间不含 ]] 或换行。
@@ -157,15 +157,15 @@ export function QuestionInput({
           onHover={setSelectedIndex}
         />
       )}
-      <div className="mt-2 flex items-center justify-between">
-        <span className="text-xs text-slate-400 dark:text-slate-500">
+      <div className="mt-2 flex items-center justify-between gap-2">
+        <span className="hidden text-xs text-slate-400 sm:inline dark:text-slate-500">
           按{' '}
           <kbd className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-slate-800 dark:text-slate-300">
             ⌘/Ctrl + Enter
           </kbd>{' '}
           发送
         </span>
-        <div className="flex gap-2">
+        <div className="ml-auto flex gap-2">
           {loading && (
             <button
               type="button"

@@ -45,25 +45,29 @@ export function AnswerView({ answer, latencyMs }: AnswerViewProps) {
       )}
 
       {answer.cards.length > 0 && (
-        <section>
-          <h2 className="mb-2 text-sm font-semibold text-slate-900 dark:text-slate-100">引用牌张</h2>
-          <div className="space-y-3">
+        <details className="rounded-lg border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900">
+          <summary className="cursor-pointer select-none px-3 py-2 text-sm font-semibold text-slate-900 hover:bg-slate-50 dark:text-slate-100 dark:hover:bg-slate-800/50">
+            引用牌张 <span className="ml-1 text-xs font-normal text-slate-500 dark:text-slate-400">{answer.cards.length}</span>
+          </summary>
+          <div className="space-y-3 border-t border-slate-100 p-3 dark:border-slate-800">
             {answer.cards.map((c, i) => (
               <CardCard key={`${c.oracle_name ?? c.name}-${i}`} card={c} />
             ))}
           </div>
-        </section>
+        </details>
       )}
 
       {answer.rules.length > 0 && (
-        <section>
-          <h2 className="mb-2 text-sm font-semibold text-slate-900 dark:text-slate-100">引用规则</h2>
-          <div className="space-y-3">
+        <details className="rounded-lg border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900">
+          <summary className="cursor-pointer select-none px-3 py-2 text-sm font-semibold text-slate-900 hover:bg-slate-50 dark:text-slate-100 dark:hover:bg-slate-800/50">
+            引用规则 <span className="ml-1 text-xs font-normal text-slate-500 dark:text-slate-400">{answer.rules.length}</span>
+          </summary>
+          <div className="space-y-3 border-t border-slate-100 p-3 dark:border-slate-800">
             {answer.rules.map((r, i) => (
               <RuleCard key={`${r.section_id}-${i}`} rule={r} />
             ))}
           </div>
-        </section>
+        </details>
       )}
 
       {answer.reasoning_summary && (
