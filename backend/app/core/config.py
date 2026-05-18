@@ -39,6 +39,30 @@ class Settings(BaseSettings):
     rate_limit_requests: int = 60  # 每窗口最大请求数
     rate_limit_window: int = 60  # 窗口秒数
     cors_origins: str = "*"  # 逗号分隔的允许来源，* 表示全部
+    # 是否信任反向代理传入的 X-Forwarded-For/X-Real-IP 头。
+    # 仅在前置了可信反代（nginx、ingress、ALB 等）时设为 true，否则攻击者可伪造 IP 绕过限流。
+    trust_proxy_headers: bool = False
+    # 同时被信任的代理跳数（从 X-Forwarded-For 右侧第 N+1 个 IP 取真实客户端）。
+    # 默认 1 表示只剥一层；K8s ingress + service mesh 可能需要更大值。
+    trusted_proxy_hops: int = 1
+
+    # LLM 编排配置
+    llm_max_tool_rounds: int = 5
+    llm_temperature: float = 0.1
+    llm_request_timeout: float = 120.0
+    llm_max_retries: int = 3
+    llm_retry_min_wait: float = 1.0
+    llm_retry_max_wait: float = 10.0
+    sse_heartbeat_interval: float = 15.0  # SSE 心跳间隔（秒）
+
+    # 检索配置
+    retrieval_rrf_k: int = 60  # RRF 融合常数
+    retrieval_cache_ttl: int = 300  # 检索结果 Redis 缓存 TTL（秒）
+    retrieval_cache_enabled: bool = True
+
+    # LLM 响应缓存
+    llm_cache_enabled: bool = False
+    llm_cache_ttl: int = 600
 
     @property
     def rules_root_path(self) -> Path:

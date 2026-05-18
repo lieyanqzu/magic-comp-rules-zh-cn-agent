@@ -17,10 +17,15 @@ MOCK_RESPONSE = JudgeResponse(
 )
 
 
+def _mock_service(response: JudgeResponse) -> MagicMock:
+    """构造一个假装是 JudgeService 的对象，ask 返回给定 response。"""
+    service = MagicMock()
+    service.ask = AsyncMock(return_value=response)
+    return service
+
+
 async def test_judge_ask_returns_structured_response(client: AsyncClient) -> None:
-    mock_agent = MagicMock()
-    mock_agent.ask = AsyncMock(return_value=MOCK_RESPONSE)
-    with patch("app.api.judge.JudgeAgent", return_value=mock_agent):
+    with patch("app.api.judge.JudgeService", return_value=_mock_service(MOCK_RESPONSE)):
         resp = await client.post("/v1/judge/ask", json={"question": "如果我操控谦卑和蛋白玛珂，生物会怎样？"})
         assert resp.status_code == 200
         data = resp.json()
@@ -29,6 +34,7 @@ async def test_judge_ask_returns_structured_response(client: AsyncClient) -> Non
         assert isinstance(data["cards"], list)
         assert isinstance(data["rules"], list)
         assert isinstance(data["needs_human_judge"], bool)
+        # latency_ms 由 service 内部赋值，但 mock 时未必有；改成存在性检查
         assert "latency_ms" in data
 
 
@@ -37,9 +43,7 @@ async def test_judge_ask_no_fabrication(client: AsyncClient) -> None:
         answer="未找到相关规则。", summary="无法确定。", confidence="low",
         rules=[], reasoning_summary="未找到匹配的规则文档。", needs_human_judge=True,
     )
-    mock_agent = MagicMock()
-    mock_agent.ask = AsyncMock(return_value=no_rule_response)
-    with patch("app.api.judge.JudgeAgent", return_value=mock_agent):
+    with patch("app.api.judge.JudgeService", return_value=_mock_service(no_rule_response)):
         resp = await client.post("/v1/judge/ask", json={"question": "一个完全虚构的问题"})
         data = resp.json()
         assert data["needs_human_judge"] is True

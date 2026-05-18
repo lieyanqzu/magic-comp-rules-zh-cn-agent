@@ -1,6 +1,9 @@
 """规则检索接口。"""
 
-from fastapi import APIRouter, Depends
+from __future__ import annotations
+
+import redis.asyncio as aioredis
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,6 +13,10 @@ from app.schemas import RuleResult
 from app.services.rule_service import RuleService
 
 router = APIRouter(dependencies=[Depends(verify_api_key)])
+
+
+def get_redis(request: Request) -> aioredis.Redis | None:
+    return getattr(request.app.state, "redis", None)
 
 
 class RuleSearchRequest(BaseModel):
@@ -25,10 +32,16 @@ class RuleSearchResponse(BaseModel):
 
 
 @router.post("/search", response_model=RuleSearchResponse)
-async def search_rules(request: RuleSearchRequest, db: AsyncSession = Depends(get_db)) -> RuleSearchResponse:
-    service = RuleService(db)
+async def search_rules(
+    request: RuleSearchRequest,
+    db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis | None = Depends(get_redis),
+) -> RuleSearchResponse:
+    service = RuleService(db, redis=redis)
     results = await service.hybrid_search(
-        query=request.query, section_id=request.section_id,
-        document_types=request.document_types, top_k=request.top_k,
+        query=request.query,
+        section_id=request.section_id,
+        document_types=request.document_types,
+        top_k=request.top_k,
     )
     return RuleSearchResponse(results=results, total=len(results))

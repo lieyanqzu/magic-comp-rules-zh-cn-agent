@@ -1,87 +1,106 @@
 """规则裁判问答接口。"""
 
-import json
-import time
+from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+import asyncio
+import json
+import uuid
+from collections.abc import AsyncIterator
+
+import redis.asyncio as aioredis
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent.judge_agent import JudgeAgent
 from app.agent.schemas import JudgeRequest, JudgeResponse
 from app.core.auth import verify_api_key
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.db.session import async_session_factory, get_db
-from app.db.models import JudgeQuery
+from app.db.session import get_db
+from app.services.judge_service import JudgeService
 
 router = APIRouter(dependencies=[Depends(verify_api_key)])
 logger = get_logger(__name__)
 
 
-async def _log_query(question: str, response: JudgeResponse, elapsed_ms: float) -> None:
-    """记录问答日志，失败不影响返回。"""
-    try:
-        async with async_session_factory() as db:
-            db.add(JudgeQuery(
-                question=question, answer=response.answer,
-                model=settings.openai_model, confidence=response.confidence,
-                used_rules=[r.model_dump() for r in response.rules],
-                used_cards=[c.model_dump() for c in response.cards],
-                latency_ms=elapsed_ms,
-                reasoning_summary=response.reasoning_summary,
-                needs_human_judge=response.needs_human_judge,
-            ))
-            await db.commit()
-    except Exception:
-        logger.warning("问答日志写入失败", question=question[:50])
+def get_redis(request: Request) -> aioredis.Redis | None:
+    return getattr(request.app.state, "redis", None)
 
 
 @router.post("/ask", response_model=JudgeResponse)
-async def ask_judge(request: JudgeRequest, db: AsyncSession = Depends(get_db)) -> JudgeResponse:
+async def ask_judge(
+    request: JudgeRequest,
+    req: Request,
+    db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis | None = Depends(get_redis),
+) -> JudgeResponse:
     """非流式接口，返回完整结构化回答。"""
-    start = time.monotonic()
-    agent = JudgeAgent()
-    response = await agent.ask(question=request.question, language=request.language)
-    elapsed = round((time.monotonic() - start) * 1000, 1)
-    response.latency_ms = elapsed
+    request_id = req.headers.get("x-request-id") or uuid.uuid4().hex[:16]
+    service = JudgeService(db, redis=redis, request_id=request_id)
+    return await service.ask(question=request.question, language=request.language)
 
-    await _log_query(request.question, response, elapsed)
-    return response
+
+async def _heartbeat_wrapper(stream: AsyncIterator[dict], interval: float) -> AsyncIterator[str]:
+    """将 agent 事件流包成 SSE。空闲超过 interval 秒就发心跳，避免反代切断长连接。"""
+    queue: asyncio.Queue = asyncio.Queue()
+    DONE = object()
+
+    async def producer() -> None:
+        try:
+            async for event in stream:
+                await queue.put(event)
+        except Exception as exc:
+            await queue.put({"type": "error", "content": str(exc)})
+        finally:
+            await queue.put(DONE)
+
+    task = asyncio.create_task(producer())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                # SSE 注释行作心跳，浏览器/EventSource 会忽略
+                yield ": heartbeat\n\n"
+                continue
+            if item is DONE:
+                return
+            yield f"data: {json.dumps(item, ensure_ascii=False, default=str)}\n\n"
+            if isinstance(item, dict) and item.get("type") == "error":
+                return
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 @router.post("/stream")
-async def stream_judge(request: JudgeRequest) -> StreamingResponse:
+async def stream_judge(
+    request: JudgeRequest,
+    req: Request,
+    db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis | None = Depends(get_redis),
+) -> StreamingResponse:
     """流式接口（SSE），逐步返回推理过程和工具调用。"""
-    agent = JudgeAgent()
+    request_id = req.headers.get("x-request-id") or uuid.uuid4().hex[:16]
+    service = JudgeService(db, redis=redis, request_id=request_id)
 
-    async def event_generator():
-        start = time.monotonic()
-        final_response = None
+    async def event_stream() -> AsyncIterator[str]:
+        async for chunk in _heartbeat_wrapper(
+            service.ask_stream(question=request.question, language=request.language),
+            interval=settings.sse_heartbeat_interval,
+        ):
+            yield chunk
 
-        try:
-            async for event in agent.ask_stream(question=request.question, language=request.language):
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                if event["type"] == "answer":
-                    final_response = event["data"]
-                elif event["type"] == "error":
-                    yield f"data: {json.dumps({'type': 'done', 'error': event['content']}, ensure_ascii=False)}\n\n"
-                    return
-        except Exception as e:
-            logger.exception("流式回答异常")
-            yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
-            return
-
-        elapsed = round((time.monotonic() - start) * 1000, 1)
-
-        if final_response:
-            try:
-                resp = JudgeResponse(**final_response)
-                resp.latency_ms = elapsed
-                await _log_query(request.question, resp, elapsed)
-            except Exception:
-                logger.warning("流式日志写入失败")
-
-        yield f"data: {json.dumps({'type': 'done', 'latency_ms': elapsed}, ensure_ascii=False)}\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # 关闭 nginx 缓冲，确保流式实时下发
+            "X-Request-ID": request_id,
+        },
+    )

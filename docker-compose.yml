@@ -1,10 +1,12 @@
 services:
   db:
     image: pgvector/pgvector:pg16
+    # 注意：以下凭据仅适用于本地开发。生产部署务必通过 .env / secrets 覆盖
+    # POSTGRES_USER / POSTGRES_PASSWORD，并修改 app.environment.DATABASE_URL。
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: mtg_judge
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-mtg_judge}
     ports:
       - "5432:5432"
     volumes:
@@ -36,7 +38,7 @@ services:
     env_file:
       - backend/.env
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/mtg_judge
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-mtg_judge}
       REDIS_URL: redis://redis:6379/0
     depends_on:
       db:

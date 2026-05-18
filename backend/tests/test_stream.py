@@ -1,11 +1,9 @@
 """流式 SSE 端点测试。"""
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 from httpx import AsyncClient
-
-from app.agent.schemas import JudgeResponse
 
 MOCK_EVENTS = [
     {"type": "start", "question": "测试问题"},
@@ -24,17 +22,22 @@ MOCK_EVENTS = [
 ]
 
 
-async def _mock_ask_stream(question, language="zh-CN", max_tool_rounds=5):
+async def _mock_ask_stream(question, language="zh-CN"):
     for event in MOCK_EVENTS:
         yield event
+    # service 层会再补一个 done 事件，这里 mock 完整流程
+    yield {"type": "done", "latency_ms": 1.0, "request_id": "test"}
+
+
+def _mock_service() -> MagicMock:
+    service = MagicMock()
+    service.ask_stream = _mock_ask_stream
+    return service
 
 
 async def test_stream_returns_sse_events(client: AsyncClient) -> None:
     """POST /v1/judge/stream 应返回 SSE 事件流。"""
-    mock_agent = MagicMock()
-    mock_agent.ask_stream = _mock_ask_stream
-
-    with patch("app.api.judge.JudgeAgent", return_value=mock_agent):
+    with patch("app.api.judge.JudgeService", return_value=_mock_service()):
         async with client.stream(
             "POST",
             "/v1/judge/stream",
@@ -49,7 +52,6 @@ async def test_stream_returns_sse_events(client: AsyncClient) -> None:
                     event = json.loads(line[6:])
                     events.append(event)
 
-            # 应包含 start、thinking、tool_call、tool_result、answer、done
             types = [e["type"] for e in events]
             assert "start" in types
             assert "thinking" in types
@@ -61,10 +63,7 @@ async def test_stream_returns_sse_events(client: AsyncClient) -> None:
 
 async def test_stream_answer_has_correct_structure(client: AsyncClient) -> None:
     """流式回答应包含完整结构化数据。"""
-    mock_agent = MagicMock()
-    mock_agent.ask_stream = _mock_ask_stream
-
-    with patch("app.api.judge.JudgeAgent", return_value=mock_agent):
+    with patch("app.api.judge.JudgeService", return_value=_mock_service()):
         async with client.stream(
             "POST",
             "/v1/judge/stream",

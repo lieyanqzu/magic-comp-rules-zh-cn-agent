@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 import redis.asyncio as aioredis
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
@@ -71,39 +72,61 @@ class CardService:
 
     # ---- DB 缓存层 ----
 
-    async def _db_get(self, input_name: str) -> CardCache | None:
+    async def _db_get(self, input_name: str) -> tuple[CardCache | None, bool]:
+        """读取 DB 行并判断是否新鲜。返回 (row, is_fresh)。
+
+        即使过期也要把行带回来，调用方决定走 UPDATE 而不是 INSERT，
+        避免 input_name 累积重复行。
+        """
         result = await self.db.execute(select(CardCache).where(CardCache.input_name == input_name))
         card = result.scalar_one_or_none()
-        if card and card.last_fetched_at:
+        if card is None:
+            return None, False
+        if card.last_fetched_at:
             age = datetime.now(UTC) - card.last_fetched_at
-            if age.days < DB_CACHE_TTL_DAYS:
-                return card
-        return None
+            return card, age.days < DB_CACHE_TTL_DAYS
+        return card, False
 
-    async def _db_save(self, card_data: dict) -> None:
-        card = CardCache(
-            input_name=card_data["input_name"],
-            resolved_zh_name=card_data.get("resolved_zh_name"),
-            oracle_name=card_data.get("oracle_name"),
-            oracle_text=card_data.get("oracle_text"),
-            type_line=card_data.get("type_line"),
-            mana_cost=card_data.get("mana_cost"),
-            scryfall_id=card_data.get("scryfall_id"),
-            raw_json=card_data,
-            last_fetched_at=datetime.now(UTC),
+    async def _db_upsert(self, card_data: dict) -> None:
+        """按 input_name UPSERT 到 card_cache。
+
+        依赖迁移 002 中的 UNIQUE(input_name) 约束。SQLite 测试环境通过相同列名也能工作，
+        因为 Postgres dialect 的 ON CONFLICT 在 PG 才生效；这里用 select-then-update/insert 兜底
+        以保证测试也能跑。
+        """
+        payload = {
+            "input_name": card_data["input_name"],
+            "resolved_zh_name": card_data.get("resolved_zh_name"),
+            "oracle_name": card_data.get("oracle_name"),
+            "oracle_text": card_data.get("oracle_text"),
+            "type_line": card_data.get("type_line"),
+            "mana_cost": card_data.get("mana_cost"),
+            "scryfall_id": card_data.get("scryfall_id"),
+            "raw_json": card_data,
+            "last_fetched_at": datetime.now(UTC),
+        }
+
+        dialect = self.db.bind.dialect.name if self.db.bind else ""
+        if dialect == "postgresql":
+            stmt = pg_insert(CardCache).values(**payload)
+            update_cols = {k: stmt.excluded[k] for k in payload if k != "input_name"}
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["input_name"], set_=update_cols
+            )
+            await self.db.execute(stmt)
+            await self.db.commit()
+            return
+
+        # 非 PG（测试环境 SQLite）走 select-then-update/insert
+        existing = await self.db.execute(
+            select(CardCache).where(CardCache.input_name == payload["input_name"])
         )
-        self.db.add(card)
-        await self.db.commit()
-
-    async def _db_update(self, card: CardCache, card_data: dict) -> None:
-        card.resolved_zh_name = card_data.get("resolved_zh_name")
-        card.oracle_name = card_data.get("oracle_name")
-        card.oracle_text = card_data.get("oracle_text")
-        card.type_line = card_data.get("type_line")
-        card.mana_cost = card_data.get("mana_cost")
-        card.scryfall_id = card_data.get("scryfall_id")
-        card.raw_json = card_data
-        card.last_fetched_at = datetime.now(UTC)
+        row = existing.scalar_one_or_none()
+        if row is None:
+            self.db.add(CardCache(**payload))
+        else:
+            for k, v in payload.items():
+                setattr(row, k, v)
         await self.db.commit()
 
     # ---- 主查询逻辑 ----
@@ -118,9 +141,9 @@ class CardService:
             logger.info("Redis 缓存命中", name=input_name)
             return _card_data_to_info(cached)
 
-        # 2. DB 缓存
-        db_card = await self._db_get(input_name)
-        if db_card and db_card.oracle_text:
+        # 2. DB 缓存（即使过期也保留行引用，避免 UPSERT 时累积脏数据）
+        db_card, is_fresh = await self._db_get(input_name)
+        if is_fresh and db_card and db_card.oracle_text:
             logger.info("DB 缓存命中", name=input_name)
             card_data = {
                 "input_name": db_card.input_name,
@@ -140,11 +163,8 @@ class CardService:
         if not card_data:
             return None
 
-        # 写入缓存
+        # 写入缓存：UPSERT 一次搞定，旧行会被覆盖而不是堆积
         await self._redis_set(redis_key, card_data)
-        if db_card:
-            await self._db_update(db_card, card_data)
-        else:
-            await self._db_save(card_data)
+        await self._db_upsert(card_data)
 
         return _card_data_to_info(card_data)

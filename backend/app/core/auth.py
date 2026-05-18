@@ -1,5 +1,7 @@
 """可选 API Key 认证依赖。"""
 
+import secrets
+
 from fastapi import Header, HTTPException
 
 from app.core.config import settings
@@ -21,6 +23,7 @@ async def verify_api_key(x_api_key: str | None = Header(None, alias="X-API-Key")
         logger.warning("缺少 API Key")
         raise HTTPException(status_code=401, detail="缺少 X-API-Key 请求头")
 
-    if x_api_key != settings.api_key:
+    # timing-safe 比较，避免侧信道攻击
+    if not secrets.compare_digest(x_api_key.encode("utf-8"), settings.api_key.encode("utf-8")):
         logger.warning("API Key 无效", provided=x_api_key[:8] + "***")
         raise HTTPException(status_code=401, detail="API Key 无效")
