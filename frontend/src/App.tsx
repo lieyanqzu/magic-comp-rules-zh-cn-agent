@@ -82,7 +82,12 @@ function App() {
         )}
 
         <div className="sticky bottom-0 -mx-4 mt-auto bg-gradient-to-t from-slate-50 via-slate-50 px-4 pb-1 pt-4 sm:-mx-6 sm:px-6 dark:from-slate-950 dark:via-slate-950">
-          <QuestionInput onSubmit={(q) => void ask(q, settings)} onCancel={cancel} loading={loading} />
+          <QuestionInput
+            onSubmit={(q) => void ask(q, settings)}
+            onCancel={cancel}
+            loading={loading}
+            settings={settings}
+          />
         </div>
       </main>
 

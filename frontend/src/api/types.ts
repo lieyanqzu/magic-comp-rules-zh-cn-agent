@@ -126,6 +126,22 @@ export type StreamEvent =
   | ErrorEvent
   | DoneEvent
 
+// ---- Autocomplete ----
+
+export interface AutocompleteItem {
+  name_en: string
+  name_zh: string
+  type_zh?: string
+  mana_cost?: string
+  set?: string
+  collector_number?: string
+  rarity?: string
+}
+
+export interface AutocompleteResponse {
+  items: AutocompleteItem[]
+}
+
 // ---- BYOK / 设置 ----
 
 export interface LLMOverride {

@@ -1,5 +1,5 @@
 import { apiKeyHeader, byokHeaders } from './headers'
-import type { AppSettings, JudgeResponse, StreamEvent } from './types'
+import type { AppSettings, AutocompleteResponse, JudgeResponse, StreamEvent } from './types'
 
 /**
  * 非流式问答。命中 L1 安全过滤会直接返回拒绝消息（answer 字段就是给用户看的）。
@@ -98,6 +98,23 @@ function parseSseFrame(frame: string): StreamEvent | null {
 
 export async function healthCheck(): Promise<{ status: string; checks: Record<string, string> }> {
   const resp = await fetch('/health')
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+  return resp.json()
+}
+
+// ---- 牌名自动补全 ----
+
+export async function autocompleteCard(
+  q: string,
+  settings: AppSettings,
+  signal?: AbortSignal,
+  limit = 8,
+): Promise<AutocompleteResponse> {
+  const params = new URLSearchParams({ q, limit: String(limit) })
+  const resp = await fetch(`/v1/cards/autocomplete?${params}`, {
+    headers: { ...apiKeyHeader(settings.apiKey) },
+    signal,
+  })
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
   return resp.json()
 }

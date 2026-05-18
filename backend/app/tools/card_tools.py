@@ -205,3 +205,28 @@ async def search_cards(query: str, page: int = 1) -> dict | None:
         "page": page,
         "items": results,
     }
+
+
+async def autocomplete_cards(query: str, limit: int = 10) -> list[dict]:
+    """牌名自动补全。调用 mtgch /autocomplete，返回精简字段供前端下拉。
+
+    返回的 mana_cost 已剥去 HTML 标签（如 "{1}{G}"），type 优先中文。
+    """
+    if not query or not query.strip():
+        return []
+    data = await _get(f"{settings.mtgch_api_url}/autocomplete/", {"q": query.strip()})
+    if not data or not isinstance(data, dict):
+        return []
+    items = data.get("items", [])[:limit]
+    results: list[dict] = []
+    for item in items:
+        results.append({
+            "name_en": item.get("name", ""),
+            "name_zh": item.get("display_name") or item.get("name", ""),
+            "type_zh": item.get("atomic_translated_type", ""),
+            "mana_cost": _strip_html(item.get("mana_cost", "")),
+            "set": item.get("set", ""),
+            "collector_number": item.get("collector_number", ""),
+            "rarity": item.get("rarity", ""),
+        })
+    return results
