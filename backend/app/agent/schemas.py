@@ -1,8 +1,21 @@
 """Agent 请求与响应的 Pydantic 模型。"""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from app.schemas import CardFace, CardRuling
+
+
+class HistoryMessage(BaseModel):
+    """对话历史中的一条消息。前端把过往轮次以这种形式回传，
+    后端注入到 LLM messages 里以保留上下文。"""
+    role: Literal["user", "assistant"]
+    content: str = Field(..., min_length=1, max_length=8000)
+
+
+# 最多回传多少条历史。10 轮 (=20 条) 已经远超合理对话长度
+MAX_HISTORY_MESSAGES = 20
 
 
 class CardRef(BaseModel):
@@ -38,6 +51,11 @@ class JudgeRequest(BaseModel):
     """裁判问答请求。"""
     question: str = Field(..., min_length=1, max_length=5000)
     language: str = Field("zh-CN")
+    history: list[HistoryMessage] = Field(
+        default_factory=list,
+        max_length=MAX_HISTORY_MESSAGES,
+        description="过往对话历史（user/assistant 交替）。当前问题不应包含在内。",
+    )
 
 
 class JudgeResponse(BaseModel):

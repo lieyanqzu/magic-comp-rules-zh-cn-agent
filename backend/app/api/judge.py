@@ -68,7 +68,8 @@ async def ask_judge(
     request_id = req.headers.get("x-request-id") or uuid.uuid4().hex[:16]
     override = _llm_override_from_headers(x_llm_api_key, x_llm_base_url, x_llm_model)
     service = JudgeService(db, redis=redis, request_id=request_id, llm_override=override)
-    return await service.ask(question=request.question, language=request.language)
+    history = [m.model_dump() for m in request.history] if request.history else None
+    return await service.ask(question=request.question, language=request.language, history=history)
 
 
 async def _heartbeat_wrapper(stream: AsyncIterator[dict], interval: float) -> AsyncIterator[str]:
@@ -125,10 +126,11 @@ async def stream_judge(
     request_id = req.headers.get("x-request-id") or uuid.uuid4().hex[:16]
     override = _llm_override_from_headers(x_llm_api_key, x_llm_base_url, x_llm_model)
     service = JudgeService(db, redis=redis, request_id=request_id, llm_override=override)
+    history = [m.model_dump() for m in request.history] if request.history else None
 
     async def event_stream() -> AsyncIterator[str]:
         async for chunk in _heartbeat_wrapper(
-            service.ask_stream(question=request.question, language=request.language),
+            service.ask_stream(question=request.question, language=request.language, history=history),
             interval=settings.sse_heartbeat_interval,
         ):
             yield chunk

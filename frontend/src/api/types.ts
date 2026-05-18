@@ -126,6 +126,13 @@ export type StreamEvent =
   | ErrorEvent
   | DoneEvent
 
+// ---- 对话历史（发给后端） ----
+
+export interface HistoryMessage {
+  role: 'user' | 'assistant'
+  content: string
+}
+
 // ---- Autocomplete ----
 
 export interface AutocompleteItem {

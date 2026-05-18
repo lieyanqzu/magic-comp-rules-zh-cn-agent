@@ -22,7 +22,7 @@ MOCK_EVENTS = [
 ]
 
 
-async def _mock_ask_stream(question, language="zh-CN"):
+async def _mock_ask_stream(question, language="zh-CN", history=None):
     for event in MOCK_EVENTS:
         yield event
     # service 层会再补一个 done 事件，这里 mock 完整流程

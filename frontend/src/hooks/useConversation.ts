@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { askJudge, streamJudge } from '../api'
 import type {
   AppSettings,
+  HistoryMessage,
   JudgeResponse,
   StreamEvent,
   ToolCallEvent,
@@ -29,6 +30,21 @@ export interface Exchange {
 
 const STORAGE_KEY = 'mtg-judge-conversation-v1'
 const MAX_PERSIST = 20 // 持久化最多 20 轮，避免 localStorage 膨胀
+// 发给后端的最近 N 轮（共 2N 条消息）。后端硬上限 20 条。
+// 4 轮 = 8 条 ≈ 4-8KB，对绝大多数模型都安全。
+const MAX_HISTORY_EXCHANGES = 4
+
+/** 从已有 exchanges 抽取 LLM 历史。只取成功的轮次（有 answer.answer 文本），舍弃错误/进行中的。 */
+function buildHistory(exchanges: Exchange[]): HistoryMessage[] {
+  const recent = exchanges.slice(-MAX_HISTORY_EXCHANGES)
+  const messages: HistoryMessage[] = []
+  for (const e of recent) {
+    if (e.error || e.loading || !e.answer || !e.answer.answer.trim()) continue
+    messages.push({ role: 'user', content: e.question })
+    messages.push({ role: 'assistant', content: e.answer.answer })
+  }
+  return messages
+}
 
 function loadExchanges(): Exchange[] {
   try {
@@ -174,11 +190,16 @@ export function useConversation() {
         loading: true,
         stream: settings.stream,
       }
-      setExchanges((prev) => [...prev, exchange])
+      // 在 setExchanges 前快照历史，确保不把当前这轮算进去
+      let history: HistoryMessage[] = []
+      setExchanges((prev) => {
+        history = buildHistory(prev)
+        return [...prev, exchange]
+      })
 
       try {
         if (settings.stream) {
-          for await (const event of streamJudge(question, settings, controller.signal)) {
+          for await (const event of streamJudge(question, settings, controller.signal, history)) {
             const entry = describe(event)
             if (entry) {
               updateExchange(id, (e) => ({ trace: [...e.trace, entry] }))
@@ -195,7 +216,7 @@ export function useConversation() {
           }
           updateExchange(id, { loading: false })
         } else {
-          const answer = await askJudge(question, settings, controller.signal)
+          const answer = await askJudge(question, settings, controller.signal, history)
           updateExchange(id, {
             answer,
             latencyMs: answer.latency_ms ?? null,

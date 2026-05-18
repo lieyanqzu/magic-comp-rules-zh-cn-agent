@@ -140,7 +140,12 @@ class JudgeService:
         except Exception:
             logger.warning("LLM 响应缓存写入失败", request_id=self.request_id)
 
-    async def ask(self, question: str, language: str = "zh-CN") -> JudgeResponse:
+    async def ask(
+        self,
+        question: str,
+        language: str = "zh-CN",
+        history: list[dict] | None = None,
+    ) -> JudgeResponse:
         """非流式：返回完整结构化回答。"""
         # L1 输入预过滤：明显的滥用 / injection 在 LLM 调用前直接拦截，零 token 成本
         verdict = check_input_safety(question)
@@ -154,22 +159,29 @@ class JudgeService:
             await self._log_query(question, response, 0.0)
             return response
 
-        cached = await self._read_llm_cache(question, language)
-        if cached is not None:
-            cached.latency_ms = 0.0
-            return cached
+        # 多轮对话不命中共享缓存：相同问题在不同上下文里回答可能不同
+        has_history = bool(history)
+        if not has_history:
+            cached = await self._read_llm_cache(question, language)
+            if cached is not None:
+                cached.latency_ms = 0.0
+                return cached
 
         start = time.monotonic()
-        response = await self.agent.ask(question=question, language=language)
+        response = await self.agent.ask(question=question, language=language, history=history)
         elapsed = round((time.monotonic() - start) * 1000, 1)
         response.latency_ms = elapsed
 
         await self._log_query(question, response, elapsed)
-        await self._write_llm_cache(question, language, response)
+        if not has_history:
+            await self._write_llm_cache(question, language, response)
         return response
 
     async def ask_stream(
-        self, question: str, language: str = "zh-CN"
+        self,
+        question: str,
+        language: str = "zh-CN",
+        history: list[dict] | None = None,
     ) -> AsyncIterator[dict]:
         """流式：把 agent 事件原样转发，并在结束时记录日志。"""
         # L1 输入预过滤：拦截后发一个 answer + done 事件，前端无需特殊处理
@@ -188,10 +200,11 @@ class JudgeService:
             yield {"type": "done", "latency_ms": 0.0, "request_id": self.request_id}
             return
 
+        has_history = bool(history)
         start = time.monotonic()
         final_payload: dict | None = None
 
-        async for event in self.agent.ask_stream(question=question, language=language):
+        async for event in self.agent.ask_stream(question=question, language=language, history=history):
             yield event
             if event["type"] == "answer":
                 final_payload = event["data"]
@@ -203,7 +216,8 @@ class JudgeService:
                 response = JudgeResponse(**final_payload)
                 response.latency_ms = elapsed
                 await self._log_query(question, response, elapsed)
-                await self._write_llm_cache(question, language, response)
+                if not has_history:
+                    await self._write_llm_cache(question, language, response)
             except Exception:
                 logger.warning("流式日志写入失败", request_id=self.request_id)
 

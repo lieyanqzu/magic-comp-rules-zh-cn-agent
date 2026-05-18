@@ -1,5 +1,11 @@
 import { apiKeyHeader, byokHeaders } from './headers'
-import type { AppSettings, AutocompleteResponse, JudgeResponse, StreamEvent } from './types'
+import type {
+  AppSettings,
+  AutocompleteResponse,
+  HistoryMessage,
+  JudgeResponse,
+  StreamEvent,
+} from './types'
 
 /**
  * 非流式问答。命中 L1 安全过滤会直接返回拒绝消息（answer 字段就是给用户看的）。
@@ -8,6 +14,7 @@ export async function askJudge(
   question: string,
   settings: AppSettings,
   signal?: AbortSignal,
+  history?: HistoryMessage[],
 ): Promise<JudgeResponse> {
   const resp = await fetch('/v1/judge/ask', {
     method: 'POST',
@@ -16,7 +23,7 @@ export async function askJudge(
       ...apiKeyHeader(settings.apiKey),
       ...byokHeaders(settings.llm),
     },
-    body: JSON.stringify({ question, language: 'zh-CN' }),
+    body: JSON.stringify({ question, language: 'zh-CN', history: history ?? [] }),
     signal,
   })
   if (!resp.ok) {
@@ -34,6 +41,7 @@ export async function* streamJudge(
   question: string,
   settings: AppSettings,
   signal?: AbortSignal,
+  history?: HistoryMessage[],
 ): AsyncGenerator<StreamEvent, void, unknown> {
   const resp = await fetch('/v1/judge/stream', {
     method: 'POST',
@@ -43,7 +51,7 @@ export async function* streamJudge(
       ...apiKeyHeader(settings.apiKey),
       ...byokHeaders(settings.llm),
     },
-    body: JSON.stringify({ question, language: 'zh-CN' }),
+    body: JSON.stringify({ question, language: 'zh-CN', history: history ?? [] }),
     signal,
   })
   if (!resp.ok) {

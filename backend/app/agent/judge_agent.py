@@ -304,8 +304,18 @@ class JudgeAgent:
             return json.dumps({"count": 0, "items": [], "query": query}, ensure_ascii=False), None
         return json.dumps({"error": f"未知工具: {name}"}, ensure_ascii=False), None
 
-    async def ask_stream(self, question: str, language: str = "zh-CN") -> AsyncIterator[dict]:
-        """流式执行裁判问答，逐事件 yield。"""
+    async def ask_stream(
+        self,
+        question: str,
+        language: str = "zh-CN",
+        history: list[dict] | None = None,
+    ) -> AsyncIterator[dict]:
+        """流式执行裁判问答，逐事件 yield。
+
+        history: [{"role": "user"|"assistant", "content": str}, ...]
+            过往轮次，由前端从对话历史中抽取（assistant 只传 answer 文本，省 token）。
+            当前 question 不应包含在内 —— 它会单独作为最后一条 user message 追加。
+        """
         yield _event("start", question=question, request_id=self.request_id)
 
         rule_numbers = extract_rule_numbers(question)
@@ -318,10 +328,17 @@ class JudgeAgent:
             else ""
         )
 
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": f"{question}{rule_hint}\n\n请严格按照 JSON 格式返回结构化结果。"},
-        ]
+        messages: list[dict] = [{"role": "system", "content": self.system_prompt}]
+        # 历史以 user/assistant 朴素文本注入；只保证 role 合法、内容非空
+        if history:
+            for msg in history:
+                role = msg.get("role")
+                content = (msg.get("content") or "").strip()
+                if role in ("user", "assistant") and content:
+                    messages.append({"role": role, "content": content})
+        messages.append(
+            {"role": "user", "content": f"{question}{rule_hint}\n\n请严格按照 JSON 格式返回结构化结果。"}
+        )
 
         collected_cards: list[dict] = []
         collected_rules: list[dict] = []
@@ -450,9 +467,14 @@ class JudgeAgent:
             yield _event("error", content=f"最终回答生成失败: {e}")
             raise LLMError(f"最终回答生成失败: {e}") from e
 
-    async def ask(self, question: str, language: str = "zh-CN") -> JudgeResponse:
+    async def ask(
+        self,
+        question: str,
+        language: str = "zh-CN",
+        history: list[dict] | None = None,
+    ) -> JudgeResponse:
         """非流式接口，兼容旧代码。"""
-        async for event in self.ask_stream(question, language):
+        async for event in self.ask_stream(question, language, history=history):
             if event["type"] == "answer":
                 return JudgeResponse(**event["data"])
             if event["type"] == "error":
