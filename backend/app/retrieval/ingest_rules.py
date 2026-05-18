@@ -83,21 +83,22 @@ async def _upsert_chunk(
     update_embedding=False 时保留旧的 embedding（content 未变就不浪费一次 API 调用）。
     """
     dialect = db.bind.dialect.name if db.bind else ""
-    payload = {
+    # PG 路径用列名（注意 metadata_ 在 DB 是 metadata），ORM 兜底路径用属性名
+    pg_payload = {
         "document_type": chunk.document_type,
         "source_path": chunk.source_path,
         "section_id": chunk.section_id,
         "title": chunk.title,
         "content": chunk.content,
         "content_hash": chunk.content_hash,
-        "metadata_": chunk.metadata,
+        "metadata": chunk.metadata,
     }
     if update_embedding:
-        payload["embedding"] = embedding
+        pg_payload["embedding"] = embedding
 
     if dialect == "postgresql":
-        stmt = pg_insert(RuleChunk).values(**payload)
-        update_cols = {k: stmt.excluded[k] for k in payload}
+        stmt = pg_insert(RuleChunk.__table__).values(**pg_payload)
+        update_cols = {k: stmt.excluded[k] for k in pg_payload}
         stmt = stmt.on_conflict_do_update(
             constraint="uq_rule_chunks_source_section",
             set_=update_cols,
@@ -105,7 +106,9 @@ async def _upsert_chunk(
         await db.execute(stmt)
         return
 
-    # 兜底：select-then-update/insert
+    # 兜底：select-then-update/insert（用 ORM 属性名）
+    orm_payload = {**pg_payload}
+    orm_payload["metadata_"] = orm_payload.pop("metadata")
     existing = await db.execute(
         select(RuleChunk).where(
             RuleChunk.source_path == chunk.source_path,
@@ -114,9 +117,9 @@ async def _upsert_chunk(
     )
     row = existing.scalar_one_or_none()
     if row is None:
-        db.add(RuleChunk(**payload))
+        db.add(RuleChunk(**orm_payload))
     else:
-        for k, v in payload.items():
+        for k, v in orm_payload.items():
             setattr(row, k, v)
 
 

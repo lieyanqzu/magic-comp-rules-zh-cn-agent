@@ -162,8 +162,16 @@ def chunk_cr_file(content: str, source_path: str) -> list[Chunk]:
     for line in content.splitlines():
         match = _RULE_NUMBER_RE.match(line.strip())
         if match:
+            matched_id = match.group(1)
+            # CR 中文文档每条规则中英对照排版，两行用同一 section_id：
+            #   <b id='cr613-1f'>613.1f</b> 层6：...        ← 中文
+            #   <b>613.1f</b> Layer 6: ...                  ← 英文
+            # 这两行必须合并成一个 chunk，否则后写入的会按 UNIQUE 覆盖前者。
+            if matched_id == current_section_id and current_lines:
+                current_lines.append(line.strip())
+                continue
             _flush()
-            current_section_id = match.group(1)
+            current_section_id = matched_id
             current_title = line.strip()
             current_lines = [line.strip()]
             continue

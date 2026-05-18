@@ -1,5 +1,7 @@
 """向量嵌入生成模块。"""
 
+from collections import OrderedDict
+
 from openai import AsyncOpenAI
 
 from app.core.config import settings
@@ -21,20 +23,45 @@ def _get_client() -> AsyncOpenAI:
 
 MAX_CHARS = 4000  # 约 8192 token 的安全上限
 
+# 进程内 LRU 缓存：同一次请求里 LLM 多轮 search_rules 都用 original_question 当 vector_query，
+# 不缓存会导致每轮重复打一次 embedding API（~1-2s/次）。embedding 是确定性的，可安全缓存。
+_EMBED_CACHE_MAX = 256
+_embed_cache: OrderedDict[str, list[float]] = OrderedDict()
+
 
 def _truncate(text: str) -> str:
     """截断文本到安全长度。"""
     return text[:MAX_CHARS] if len(text) > MAX_CHARS else text
 
 
+def _cache_get(text: str) -> list[float] | None:
+    if text in _embed_cache:
+        _embed_cache.move_to_end(text)
+        return _embed_cache[text]
+    return None
+
+
+def _cache_put(text: str, vec: list[float]) -> None:
+    _embed_cache[text] = vec
+    _embed_cache.move_to_end(text)
+    if len(_embed_cache) > _EMBED_CACHE_MAX:
+        _embed_cache.popitem(last=False)
+
+
 async def generate_embedding(text: str) -> list[float]:
-    """为文本生成向量嵌入。"""
+    """为文本生成向量嵌入（带进程内缓存）。"""
+    truncated = _truncate(text)
+    cached = _cache_get(truncated)
+    if cached is not None:
+        return cached
     client = _get_client()
     response = await client.embeddings.create(
         model=settings.embedding_model,
-        input=_truncate(text),
+        input=truncated,
     )
-    return response.data[0].embedding
+    vec = response.data[0].embedding
+    _cache_put(truncated, vec)
+    return vec
 
 
 async def generate_embeddings_batch(texts: list[str]) -> list[list[float]]:

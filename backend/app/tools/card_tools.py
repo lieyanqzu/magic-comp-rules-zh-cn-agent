@@ -60,8 +60,8 @@ async def search_mtgch(name: str) -> dict | None:
 
 
 async def get_card_detail(set_code: str, collector_number: str) -> dict | None:
-    """通过 mtgch 获取牌张完整详情（view=2，含中文 Oracle、双面、FAQ）。"""
-    return await _get(f"{settings.mtgch_api_url}/card/{set_code}/{collector_number}/", {"view": 2})
+    """通过 mtgch 获取牌张完整详情（view=1，含中文 Oracle、双面、FAQ）。"""
+    return await _get(f"{settings.mtgch_api_url}/card/{set_code}/{collector_number}/", {"view": 1})
 
 
 def _parse_pt(pt_str: str) -> tuple[str | None, str | None, str | None]:
@@ -69,28 +69,25 @@ def _parse_pt(pt_str: str) -> tuple[str | None, str | None, str | None]:
     if not pt_str:
         return None, None, None
     clean = _strip_html(pt_str)
-    # P/T 格式: "4/4"
     if "/" in clean:
         parts = clean.split("/", 1)
         return parts[0].strip(), parts[1].strip(), None
-    # 纯数字 = defense（战役牌）
+    # 纯数字 = 战役牌的 defense
     if clean.isdigit():
         return None, None, clean
     return None, None, None
 
 
-def _extract_view2_face(face: dict) -> dict:
-    """从 view=2 格式的 face 数据中提取结构化信息。"""
+def _extract_face(face: dict) -> dict:
+    """从 mtgch view=1 的 face 数据提取结构化牌面信息。"""
     oracle_en = _strip_html(face.get("oracle_text_en_html") or face.get("oracle_text_zhs_html") or "")
     oracle_zh = _strip_html(face.get("oracle_text_atomic_html") or face.get("oracle_text_zhs_html") or "")
     type_en = face.get("type_line_en") or face.get("type_line_atomic") or ""
     type_zh = face.get("type_line_atomic") or face.get("type_line_zhs") or ""
     name_zh = face.get("name_atomic") or face.get("name_zhs") or ""
     name_en = face.get("name", "")
-    # mana_cost 在 view=2 中可能是空的，从 mana_cost_html 提取
     mana_cost = face.get("mana_cost") or ""
     if not mana_cost and face.get("mana_cost_html"):
-        # 从 HTML 中提取 {X} 格式
         raw = _strip_html(face["mana_cost_html"])
         mana_cost = raw if raw.startswith("{") else ""
 
@@ -113,7 +110,7 @@ def _extract_view2_face(face: dict) -> dict:
 async def resolve_card_name(input_name: str) -> dict | None:
     """解析牌名并获取完整信息。
 
-    流程：mtgch 搜索 → mtgch 详情(view=2) → 返回完整数据。
+    流程：mtgch 搜索 → mtgch 详情(view=1) → 返回完整数据。
     """
     logger.info("解析牌张", input_name=input_name)
 
@@ -131,32 +128,15 @@ async def resolve_card_name(input_name: str) -> dict | None:
     if not detail:
         detail = search_result
 
-    # view=2 格式解析
     primary_name = detail.get("primary_name", "")
     rulings_raw = detail.get("rulings", [])
     faces_raw = detail.get("faces", [])
 
-    # 从 faces 提取信息
-    faces = [_extract_view2_face(f) for f in faces_raw] if faces_raw else []
-
-    # 主面信息（取第一个 face）
+    faces = [_extract_face(f) for f in faces_raw] if faces_raw else []
+    # 主面取第一个 face；view=1 一定返回 faces，无需降级
     main = faces[0] if faces else {}
-
-    # 英文名从 faces[0].name 获取（view=2 不返回卡级 name）
+    # view=1 不返回卡级 name，从 faces[0].name 取
     en_name = detail.get("name") or (faces_raw[0].get("name", "") if faces_raw else "")
-
-    # 如果没有 view=2 的 faces 数据，降级到旧格式
-    if not main:
-        main = {
-            "oracle_text": detail.get("oracle_text", ""),
-            "translated_text": detail.get("atomic_translated_text") or detail.get("zhs_text") or "",
-            "type_line": detail.get("type_line") or "",
-            "translated_type": detail.get("atomic_translated_type") or detail.get("zhs_type_line") or "",
-            "mana_cost": detail.get("mana_cost", ""),
-            "power": detail.get("power"),
-            "toughness": detail.get("toughness"),
-            "defense": detail.get("defense"),
-        }
 
     result: dict = {
         "input_name": input_name,

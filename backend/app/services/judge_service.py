@@ -11,19 +11,47 @@ import json
 import time
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 
 import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent.judge_agent import JudgeAgent
+from app.agent.judge_agent import JudgeAgent, _build_client
 from app.agent.schemas import JudgeResponse
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.core.safety import check_input_safety
 from app.db.models import JudgeQuery
 from app.db.session import async_session_factory
 from app.retrieval.hybrid_search import DefaultRuleSearcher
 
 logger = get_logger(__name__)
+
+
+@dataclass(slots=True, frozen=True)
+class LLMOverride:
+    """前端自带的 LLM 配置：来自请求头 X-LLM-Api-Key / X-LLM-Base-URL / X-LLM-Model。
+
+    安全性：
+    - api_key / base_url / model 任何字段都不会写日志或入库。
+    - __repr__ 强制脱敏，防止误入 traceback / structlog 上下文。
+    - 任意字段为 None 表示该字段沿用服务器默认值。
+    """
+
+    api_key: str | None = None
+    base_url: str | None = None
+    model: str | None = None
+
+    def is_active(self) -> bool:
+        return any([self.api_key, self.base_url, self.model])
+
+    def __repr__(self) -> str:  # pragma: no cover - safety guard
+        # 永远不暴露任何字段值，即使是 base_url / model 也属于用户自定义信息
+        return f"LLMOverride(active={self.is_active()})"
+
+
+# 用户启用 BYOK 时写入 judge_queries.model 的占位值，不存任何用户自定义内容
+_BYOK_MARKER = "(byok)"
 
 
 def _normalize_question(question: str) -> str:
@@ -37,6 +65,20 @@ def _llm_cache_key(question: str, language: str) -> str:
     return f"llm_answer:{digest}"
 
 
+def _build_refusal_response(reason: str) -> JudgeResponse:
+    """L1 拦截时构造的固定拒绝回复。绕过 LLM，零 token 成本。"""
+    return JudgeResponse(
+        answer=reason,
+        summary="拒绝该请求",
+        confidence="high",
+        cards=[],
+        rules=[],
+        reasoning_summary="输入未通过安全检查，未调用 LLM。",
+        needs_human_judge=False,
+        latency_ms=0.0,
+    )
+
+
 class JudgeService:
     """裁判服务。每次请求构造一个实例，持有 db/redis 和一个 agent。"""
 
@@ -46,14 +88,26 @@ class JudgeService:
         redis: aioredis.Redis | None = None,
         *,
         request_id: str | None = None,
+        llm_override: LLMOverride | None = None,
     ) -> None:
         self.db = db
         self.redis = redis
         self.request_id = request_id or uuid.uuid4().hex[:16]
         self.searcher = DefaultRuleSearcher(db, redis)
-        self.agent = JudgeAgent(self.searcher, request_id=self.request_id)
+        self.llm_override = llm_override or LLMOverride()
+        # 用户自带 key/base_url 时构造一次性 client，否则复用模块单例（连接池更高效）
+        client = _build_client(self.llm_override.api_key, self.llm_override.base_url)
+        self.agent = JudgeAgent(
+            self.searcher,
+            client=client,
+            model=self.llm_override.model,
+            request_id=self.request_id,
+        )
 
     async def _read_llm_cache(self, question: str, language: str) -> JudgeResponse | None:
+        # 用户自带 LLM 时跳过缓存：不同 key/model 的回答可能不同，且不应让一个用户读到另一个用户的结果
+        if self.llm_override.is_active():
+            return None
         if not (settings.llm_cache_enabled and self.redis):
             return None
         try:
@@ -67,6 +121,9 @@ class JudgeService:
         return None
 
     async def _write_llm_cache(self, question: str, language: str, response: JudgeResponse) -> None:
+        # 同上，用户自带 LLM 时不写共享缓存
+        if self.llm_override.is_active():
+            return
         if not (settings.llm_cache_enabled and self.redis):
             return
         # confidence=low 或 needs_human_judge 不缓存（可能是错误回答）
@@ -85,6 +142,18 @@ class JudgeService:
 
     async def ask(self, question: str, language: str = "zh-CN") -> JudgeResponse:
         """非流式：返回完整结构化回答。"""
+        # L1 输入预过滤：明显的滥用 / injection 在 LLM 调用前直接拦截，零 token 成本
+        verdict = check_input_safety(question)
+        if not verdict.allowed:
+            logger.info(
+                "L1 输入被拦截",
+                request_id=self.request_id,
+                question_prefix=question[:50],
+            )
+            response = _build_refusal_response(verdict.reason)
+            await self._log_query(question, response, 0.0)
+            return response
+
         cached = await self._read_llm_cache(question, language)
         if cached is not None:
             cached.latency_ms = 0.0
@@ -103,6 +172,22 @@ class JudgeService:
         self, question: str, language: str = "zh-CN"
     ) -> AsyncIterator[dict]:
         """流式：把 agent 事件原样转发，并在结束时记录日志。"""
+        # L1 输入预过滤：拦截后发一个 answer + done 事件，前端无需特殊处理
+        verdict = check_input_safety(question)
+        if not verdict.allowed:
+            logger.info(
+                "L1 输入被拦截",
+                request_id=self.request_id,
+                question_prefix=question[:50],
+            )
+            yield {"type": "start", "question": question, "request_id": self.request_id}
+            yield {"type": "thinking", "content": "输入未通过安全检查，已拒绝。"}
+            response = _build_refusal_response(verdict.reason)
+            yield {"type": "answer", "data": response.model_dump()}
+            await self._log_query(question, response, 0.0)
+            yield {"type": "done", "latency_ms": 0.0, "request_id": self.request_id}
+            return
+
         start = time.monotonic()
         final_payload: dict | None = None
 
@@ -130,7 +215,11 @@ class JudgeService:
         """记录问答日志。失败不影响主流程。
 
         使用独立 session，因为请求 session 可能在响应返回后就被关掉。
+        安全：用户自带 LLM (BYOK) 时，model 字段写占位符；
+        永不入库 api_key / base_url / 用户提供的 model 名。
         """
+        # BYOK 启用时一律写占位符，不区分用户具体覆盖了哪些字段（任意字段都视为隐私）
+        model_for_log = _BYOK_MARKER if self.llm_override.is_active() else settings.openai_model
         try:
             async with async_session_factory() as db:
                 db.add(
@@ -138,7 +227,7 @@ class JudgeService:
                         request_id=self.request_id,
                         question=question,
                         answer=response.answer,
-                        model=settings.openai_model,
+                        model=model_for_log,
                         confidence=response.confidence,
                         used_rules=[r.model_dump() for r in response.rules],
                         used_cards=[c.model_dump() for c in response.cards],

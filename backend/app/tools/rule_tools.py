@@ -4,6 +4,7 @@ import re
 
 from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from app.core.logging import get_logger
 from app.db.models import RuleChunk
@@ -12,13 +13,17 @@ logger = get_logger(__name__)
 RULE_NUMBER_PATTERN = re.compile(r"^\d{3}(?:\.\d+[a-z]?)?$")
 RULE_NUMBER_FINDALL = re.compile(r"\b\d{3}(?:\.\d+[a-z]?)?\b")
 
+# 检索时永远不要把 1024 维 embedding 拉回 Python：单行 ~21KB，云端 PG 来回会让单条 SELECT
+# 慢到 20+ 秒。向量检索的 ORDER BY 在 PG 端用即可，不必 SELECT 出来。
+_DEFER_EMBEDDING = (defer(RuleChunk.embedding),)
+
 
 def extract_rule_numbers(text_input: str) -> list[str]:
     return RULE_NUMBER_FINDALL.findall(text_input)
 
 
 async def search_by_section_id(db: AsyncSession, section_id: str, document_types: list[str] | None = None) -> list[RuleChunk]:
-    query = select(RuleChunk).where(RuleChunk.section_id == section_id)
+    query = select(RuleChunk).options(*_DEFER_EMBEDDING).where(RuleChunk.section_id == section_id)
     if document_types:
         query = query.where(RuleChunk.document_type.in_(document_types))
     result = await db.execute(query)
@@ -74,7 +79,7 @@ async def _search_by_keyword_pg(
         )
     order_expr = " + ".join(order_terms)
 
-    stmt = select(RuleChunk).where(or_(*conds))
+    stmt = select(RuleChunk).options(*_DEFER_EMBEDDING).where(or_(*conds))
     if document_types:
         stmt = stmt.where(RuleChunk.document_type.in_(document_types))
     stmt = stmt.order_by(text(f"({order_expr}) DESC")).limit(limit)
@@ -99,7 +104,7 @@ async def _search_by_keyword_fallback(
         conditions.append(RuleChunk.title.ilike(term))
         conditions.append(RuleChunk.content.ilike(term))
 
-    stmt = select(RuleChunk).where(or_(*conditions))
+    stmt = select(RuleChunk).options(*_DEFER_EMBEDDING).where(or_(*conditions))
     if document_types:
         stmt = stmt.where(RuleChunk.document_type.in_(document_types))
     stmt = stmt.limit(limit * 3)

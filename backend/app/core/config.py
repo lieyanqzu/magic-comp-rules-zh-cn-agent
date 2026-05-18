@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # 数据库连接池
     db_pool_size: int = 10
     db_max_overflow: int = 5
+    # SQL echo（打印每条 SQL 与参数）。即使 dev 也默认关闭：
+    # rule_chunks 包含 1024 维 embedding，每条 SELECT 会把 21KB 向量字符串化打印两次，
+    # 严重拖慢检索（实测 ~22s/SQL → <1s）。需要排查时单独打开。
+    db_echo: bool = False
 
     # 安全配置
     api_key: str = ""  # 空则跳过认证
@@ -63,6 +67,12 @@ class Settings(BaseSettings):
     # LLM 响应缓存
     llm_cache_enabled: bool = False
     llm_cache_ttl: int = 600
+
+    # 启动时自动增量入库（基于 content_hash + 删除孤儿）
+    # 适合规则文档作为 git 子模块、随时更新的场景；本地频繁重启时建议关闭
+    auto_ingest_on_startup: bool = False
+    # 自动入库时是否同步生成 embedding（关闭可加快启动，但新增/变更 chunk 没有向量）
+    auto_ingest_embeddings: bool = True
 
     @property
     def rules_root_path(self) -> Path:

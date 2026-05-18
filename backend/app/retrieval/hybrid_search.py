@@ -9,6 +9,7 @@ from typing import Iterable, Protocol
 import redis.asyncio as aioredis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -20,6 +21,10 @@ logger = get_logger(__name__)
 
 # RRF 单路最大候选数
 _RRF_PER_BRANCH = 30
+
+# embedding 列即使是向量检索也无需 SELECT 出来：ORDER BY 在 PG 端用就够了，
+# 否则单条 SELECT 会带回 30 行 × 1024 维 ≈ 600KB，到云端 PG 的网络往返让单条 SQL 跑 20+ 秒。
+_DEFER_EMBEDDING = (defer(RuleChunk.embedding),)
 
 
 class RuleSearcher(Protocol):
@@ -89,6 +94,7 @@ async def _vector_search(
     distance = RuleChunk.embedding.cosine_distance(query_embedding)
     stmt = (
         select(RuleChunk)
+        .options(*_DEFER_EMBEDDING)
         .where(RuleChunk.embedding.is_not(None))
         .order_by(distance)
         .limit(top_k)
@@ -128,7 +134,9 @@ async def hybrid_search(
             if cached:
                 ids = json.loads(cached)
                 if ids:
-                    rows = await db.execute(select(RuleChunk).where(RuleChunk.id.in_(ids)))
+                    rows = await db.execute(
+                        select(RuleChunk).options(*_DEFER_EMBEDDING).where(RuleChunk.id.in_(ids))
+                    )
                     by_id = {r.id: r for r in rows.scalars().all()}
                     ordered = [by_id[i] for i in ids if i in by_id]
                     if ordered:

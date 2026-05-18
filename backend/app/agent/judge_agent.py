@@ -99,6 +99,22 @@ def get_openai_client() -> AsyncOpenAI:
     return _openai_client
 
 
+def _build_client(api_key: str | None, base_url: str | None) -> AsyncOpenAI:
+    """请求级 LLM 客户端：当用户带了自己的 key/base_url 时构造一次性 client。
+
+    没传任何覆盖参数则复用模块单例（连接池更高效）。
+    """
+    if not api_key and not base_url:
+        return get_openai_client()
+    return AsyncOpenAI(
+        api_key=api_key or settings.openai_api_key,
+        base_url=base_url or settings.openai_base_url,
+        timeout=httpx.Timeout(
+            connect=10, read=settings.llm_request_timeout, write=10, pool=10
+        ),
+    )
+
+
 def _load_system_prompt() -> str:
     prompt_path = Path(__file__).parent / "prompts" / "mtg_judge_zh.md"
     return prompt_path.read_text(encoding="utf-8")
@@ -146,6 +162,7 @@ class JudgeAgent:
         client: AsyncOpenAI | None = None,
         max_tool_rounds: int | None = None,
         temperature: float | None = None,
+        model: str | None = None,
         request_id: str | None = None,
     ) -> None:
         self.searcher = searcher
@@ -153,6 +170,8 @@ class JudgeAgent:
         self.system_prompt = _load_system_prompt()
         self.max_tool_rounds = max_tool_rounds or settings.llm_max_tool_rounds
         self.temperature = temperature if temperature is not None else settings.llm_temperature
+        # 允许 service 层注入用户自带 model 覆盖默认值
+        self.model = model or settings.openai_model
         self.request_id = request_id
 
         # 累计 token / 轮次，service 层可读取入库
@@ -167,7 +186,7 @@ class JudgeAgent:
         force_no_tools: 达到最大轮次时调用，禁止再发起工具，强制收尾。
         """
         kwargs: dict = {
-            "model": settings.openai_model,
+            "model": self.model,
             "messages": messages,
             "response_format": {"type": "json_object"},
             "temperature": self.temperature,
@@ -257,9 +276,25 @@ class JudgeAgent:
                 }
                 for c in chunks
             ]
+            # 完整版（不截断）保留给最终结构化回答用
+            full_chunks = [
+                {
+                    "section_id": c.section_id,
+                    "title": c.title,
+                    "content": c.content,
+                    "source_path": c.source_path,
+                    "document_type": c.document_type,
+                }
+                for c in chunks
+            ]
             return (
                 json.dumps(results, ensure_ascii=False),
-                {"query": query, "section_id": section_id, "results_count": len(results)},
+                {
+                    "query": query,
+                    "section_id": section_id,
+                    "results_count": len(results),
+                    "chunks": full_chunks,
+                },
             )
         if name == "search_cards":
             query = arguments.get("query", "")
@@ -360,6 +395,10 @@ class JudgeAgent:
                         )
                 elif func_name == "search_rules":
                     count = meta.get("results_count", 0) if meta else 0
+                    if meta:
+                        # 累加真实检索结果到 collected_rules，供 _parse_response 用中文回填
+                        for chunk in meta.get("chunks", []):
+                            collected_rules.append(chunk)
                     yield _event(
                         "tool_result",
                         tool=func_name,
@@ -435,21 +474,82 @@ class JudgeAgent:
                 needs_human_judge=True,
             )
 
-        cards = [self._build_card_ref(c) for c in data.get("cards", [])]
-        existing_names = {c.name for c in cards}
+        # ---- 牌张：以工具数据为权威源 ----
+        # 工具数据按 name (中文) 和 oracle_name (英文) 双索引，便于 LLM 用任一形式引用都能匹配
+        tool_by_name: dict[str, dict] = {}
         for tc in tool_cards:
-            if tc.get("name") and tc["name"] not in existing_names:
-                cards.append(self._build_card_ref(tc))
+            for key in (tc.get("name"), tc.get("oracle_name")):
+                if key:
+                    tool_by_name.setdefault(key, tc)
 
-        rules = [
-            RuleRef(
-                section_id=r.get("section_id", ""),
-                title=r.get("title", ""),
-                content_snippet=r.get("content_snippet", ""),
-                source_path=r.get("source_path", ""),
-            )
-            for r in data.get("rules", [])
-        ]
+        merged_cards: list[dict] = []
+        seen_keys: set[str] = set()
+
+        def _card_keys(c: dict) -> list[str]:
+            return [k for k in (c.get("name"), c.get("oracle_name")) if k]
+
+        # 1) 优先按 LLM 引用顺序输出，但用工具数据覆盖空字段
+        for llm_card in data.get("cards", []):
+            tool_match: dict | None = None
+            for key in _card_keys(llm_card):
+                if key in tool_by_name:
+                    tool_match = tool_by_name[key]
+                    break
+            if tool_match:
+                # 工具数据为底，LLM 的非空字段做兜底（极少触发，防止 oracle_text 仍缺时丢失）
+                merged = {**llm_card, **{k: v for k, v in tool_match.items() if v}}
+            else:
+                merged = llm_card
+            for k in _card_keys(merged):
+                seen_keys.add(k)
+            merged_cards.append(merged)
+
+        # 2) 工具拿到但 LLM 没引用的，追加到末尾
+        for tc in tool_cards:
+            if not any(k in seen_keys for k in _card_keys(tc)):
+                merged_cards.append(tc)
+                for k in _card_keys(tc):
+                    seen_keys.add(k)
+
+        cards = [self._build_card_ref(c) for c in merged_cards]
+
+        # ---- 规则：按 section_id 回填真实中文 title/content ----
+        # 同一 section_id 可能在多次检索中重复出现，保留首次（或更长内容）
+        rule_by_sid: dict[str, dict] = {}
+        for tr in tool_rules:
+            sid = tr.get("section_id")
+            if not sid:
+                continue
+            existing = rule_by_sid.get(sid)
+            if existing is None or len(tr.get("content") or "") > len(existing.get("content") or ""):
+                rule_by_sid[sid] = tr
+
+        rules: list[RuleRef] = []
+        for r in data.get("rules", []):
+            sid = r.get("section_id", "")
+            tool_rule = rule_by_sid.get(sid)
+            if tool_rule:
+                # 工具数据胜出：title/content 用真实中文规则文本
+                content = tool_rule.get("content") or ""
+                snippet = content[:400] if content else (r.get("content_snippet") or "")
+                rules.append(
+                    RuleRef(
+                        section_id=sid,
+                        title=tool_rule.get("title") or r.get("title", ""),
+                        content_snippet=snippet,
+                        source_path=tool_rule.get("source_path") or r.get("source_path", ""),
+                    )
+                )
+            else:
+                # LLM 引用了一条没检索到的规则号 — 保留 LLM 写法但标记可信度
+                rules.append(
+                    RuleRef(
+                        section_id=sid,
+                        title=r.get("title", ""),
+                        content_snippet=r.get("content_snippet", ""),
+                        source_path=r.get("source_path", ""),
+                    )
+                )
 
         return JudgeResponse(
             answer=data.get("answer", ""),

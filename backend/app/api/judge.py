@@ -8,7 +8,7 @@ import uuid
 from collections.abc import AsyncIterator
 
 import redis.asyncio as aioredis
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,7 +17,7 @@ from app.core.auth import verify_api_key
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.session import get_db
-from app.services.judge_service import JudgeService
+from app.services.judge_service import JudgeService, LLMOverride
 
 router = APIRouter(dependencies=[Depends(verify_api_key)])
 logger = get_logger(__name__)
@@ -27,16 +27,47 @@ def get_redis(request: Request) -> aioredis.Redis | None:
     return getattr(request.app.state, "redis", None)
 
 
+def _llm_override_from_headers(
+    api_key: str | None,
+    base_url: str | None,
+    model: str | None,
+) -> LLMOverride:
+    """构造 LLMOverride 时去除空白；不打日志、不带 header 值。
+
+    安全注意：返回的对象会传给 service 层；任何异常路径都不应让 header 值进 logger。
+    """
+
+    def _clean(s: str | None) -> str | None:
+        if s is None:
+            return None
+        s = s.strip()
+        return s or None
+
+    return LLMOverride(api_key=_clean(api_key), base_url=_clean(base_url), model=_clean(model))
+
+
 @router.post("/ask", response_model=JudgeResponse)
 async def ask_judge(
     request: JudgeRequest,
     req: Request,
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis | None = Depends(get_redis),
+    x_llm_api_key: str | None = Header(None, alias="X-LLM-Api-Key"),
+    x_llm_base_url: str | None = Header(None, alias="X-LLM-Base-URL"),
+    x_llm_model: str | None = Header(None, alias="X-LLM-Model"),
 ) -> JudgeResponse:
-    """非流式接口，返回完整结构化回答。"""
+    """非流式接口，返回完整结构化回答。
+
+    可选请求头（前端自带 LLM 配置，BYOK）：
+    - X-LLM-Api-Key：覆盖服务器 OPENAI_API_KEY
+    - X-LLM-Base-URL：覆盖 base url（如使用 azure / 第三方代理）
+    - X-LLM-Model：覆盖模型名
+
+    任意一项设置后，该次请求绕过共享 LLM 缓存；服务器不会记录这些字段任何明文。
+    """
     request_id = req.headers.get("x-request-id") or uuid.uuid4().hex[:16]
-    service = JudgeService(db, redis=redis, request_id=request_id)
+    override = _llm_override_from_headers(x_llm_api_key, x_llm_base_url, x_llm_model)
+    service = JudgeService(db, redis=redis, request_id=request_id, llm_override=override)
     return await service.ask(question=request.question, language=request.language)
 
 
@@ -83,10 +114,17 @@ async def stream_judge(
     req: Request,
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis | None = Depends(get_redis),
+    x_llm_api_key: str | None = Header(None, alias="X-LLM-Api-Key"),
+    x_llm_base_url: str | None = Header(None, alias="X-LLM-Base-URL"),
+    x_llm_model: str | None = Header(None, alias="X-LLM-Model"),
 ) -> StreamingResponse:
-    """流式接口（SSE），逐步返回推理过程和工具调用。"""
+    """流式接口（SSE），逐步返回推理过程和工具调用。
+
+    可选请求头同 /ask（X-LLM-Api-Key / X-LLM-Base-URL / X-LLM-Model）。
+    """
     request_id = req.headers.get("x-request-id") or uuid.uuid4().hex[:16]
-    service = JudgeService(db, redis=redis, request_id=request_id)
+    override = _llm_override_from_headers(x_llm_api_key, x_llm_base_url, x_llm_model)
+    service = JudgeService(db, redis=redis, request_id=request_id, llm_override=override)
 
     async def event_stream() -> AsyncIterator[str]:
         async for chunk in _heartbeat_wrapper(

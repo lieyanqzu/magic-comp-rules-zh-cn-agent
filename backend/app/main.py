@@ -1,5 +1,6 @@
 """FastAPI 应用入口。"""
 
+import asyncio
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -11,9 +12,11 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from app.api import cards, health, judge, rules
 from app.core.config import settings
 from app.core.errors import AppError, app_error_handler, generic_error_handler
-from app.core.logging import setup_logging
+from app.core.logging import get_logger, setup_logging
 from app.core.rate_limit import RateLimitMiddleware
 from app.db.session import engine
+
+logger = get_logger(__name__)
 
 # 安全响应头
 SECURITY_HEADERS = {
@@ -32,13 +35,53 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         return response
 
 
+async def _run_auto_ingest() -> None:
+    """启动时增量入库。
+
+    在后台运行：
+    - 不阻塞应用启动；旧数据在新数据 commit 前依然可查。
+    - 跑完会按 content_hash 仅更新变化的 chunk，并删除孤儿（git 子模块更新后规则改名/删除时清理）。
+    - 任何异常吞掉记 warning，不影响在线请求。
+    """
+    try:
+        # 延迟 import，避免环依赖与 ingest 模块的副作用在导入期触发
+        from app.retrieval.ingest_rules import ingest_all
+
+        logger.info(
+            "启动时自动入库开始",
+            embeddings=settings.auto_ingest_embeddings,
+        )
+        await ingest_all(
+            generate_embeddings=settings.auto_ingest_embeddings,
+            rebuild=False,
+        )
+        logger.info("启动时自动入库完成")
+    except Exception as exc:
+        logger.warning("启动时自动入库失败", error=str(exc)[:200])
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     setup_logging()
     _app.state.redis = aioredis.from_url(settings.redis_url, decode_responses=True)
-    yield
-    await _app.state.redis.close()
-    await engine.dispose()
+
+    ingest_task: asyncio.Task | None = None
+    if settings.auto_ingest_on_startup:
+        # 后台异步执行，不阻塞 startup
+        ingest_task = asyncio.create_task(_run_auto_ingest(), name="auto_ingest_on_startup")
+
+    try:
+        yield
+    finally:
+        if ingest_task is not None and not ingest_task.done():
+            logger.info("关闭中：等待 auto_ingest 任务结束")
+            ingest_task.cancel()
+            try:
+                await ingest_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await _app.state.redis.close()
+        await engine.dispose()
 
 
 def create_app() -> FastAPI:
