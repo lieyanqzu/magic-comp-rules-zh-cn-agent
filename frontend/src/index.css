@@ -1,5 +1,8 @@
 @import "tailwindcss";
 
+/* Tailwind v4 默认 dark 是 prefers-color-scheme 媒体查询；这里改成手动 .dark 类 */
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
   --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "PingFang SC",
     "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
@@ -27,4 +30,10 @@ body {
 }
 ::-webkit-scrollbar-thumb:hover {
   background: rgb(148 163 184 / 0.9);
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: rgb(71 85 105 / 0.7);
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: rgb(100 116 139 / 0.9);
 }

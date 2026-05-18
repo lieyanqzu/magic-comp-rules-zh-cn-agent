@@ -11,26 +11,25 @@ interface RuleCardProps {
   rule: RuleRef
 }
 
-/** 渲染单条规则。source_path 形如 "magic-comp-rules-zh-cn/markdown/613.md"，提取文档类型作徽标。 */
 export function RuleCard({ rule }: RuleCardProps) {
   const docType = inferDocType(rule.source_path)
   const docLabel = docType ? DOC_LABELS[docType] ?? docType : null
   return (
-    <article className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+    <article className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-700 dark:bg-slate-900">
       <header className="mb-2 flex flex-wrap items-baseline gap-2">
-        <span className="rounded bg-indigo-50 px-2 py-0.5 font-mono text-xs font-semibold text-indigo-700 ring-1 ring-inset ring-indigo-200">
+        <span className="rounded bg-indigo-50 px-2 py-0.5 font-mono text-xs font-semibold text-indigo-700 ring-1 ring-inset ring-indigo-200 dark:bg-indigo-950/40 dark:text-indigo-300 dark:ring-indigo-800">
           {rule.section_id}
         </span>
-        {docLabel && <span className="text-xs text-slate-500">{docLabel}</span>}
-        {rule.title && <span className="text-sm text-slate-700">{rule.title}</span>}
+        {docLabel && <span className="text-xs text-slate-500 dark:text-slate-400">{docLabel}</span>}
+        {rule.title && <span className="text-sm text-slate-700 dark:text-slate-200">{rule.title}</span>}
       </header>
       {rule.content_snippet && (
-        <p className="whitespace-pre-wrap text-sm leading-relaxed text-slate-800">
+        <p className="whitespace-pre-wrap text-sm leading-relaxed text-slate-800 dark:text-slate-200">
           {rule.content_snippet}
         </p>
       )}
       {rule.source_path && (
-        <div className="mt-2 font-mono text-xs text-slate-400">{rule.source_path}</div>
+        <div className="mt-2 font-mono text-xs text-slate-400 dark:text-slate-500">{rule.source_path}</div>
       )}
     </article>
   )

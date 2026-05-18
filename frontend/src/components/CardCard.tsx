@@ -5,7 +5,6 @@ interface CardCardProps {
   card: CardRef
 }
 
-/** 渲染单张牌：中文优先，英文降级。 */
 export function CardCard({ card }: CardCardProps) {
   const displayText = card.translated_text || card.oracle_text || card.display_text || ''
   const displayType = card.translated_type || card.type_line || card.display_type || ''
@@ -13,14 +12,14 @@ export function CardCard({ card }: CardCardProps) {
   const ptLine = formatPT(card)
 
   return (
-    <article className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+    <article className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-700 dark:bg-slate-900">
       <header className="mb-2 flex flex-wrap items-baseline gap-x-2 gap-y-1">
-        <h3 className="text-base font-semibold text-slate-900">{card.name}</h3>
+        <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100">{card.name}</h3>
         {card.oracle_name && card.oracle_name !== card.name && (
-          <span className="text-sm text-slate-500">{card.oracle_name}</span>
+          <span className="text-sm text-slate-500 dark:text-slate-400">{card.oracle_name}</span>
         )}
         {card.mana_cost && (
-          <span className="ml-auto font-mono text-sm text-slate-600">{card.mana_cost}</span>
+          <span className="ml-auto font-mono text-sm text-slate-600 dark:text-slate-300">{card.mana_cost}</span>
         )}
       </header>
       {(displayType || ptLine) && (
@@ -33,30 +32,36 @@ export function CardCard({ card }: CardCardProps) {
         </div>
       )}
       {displayText && (
-        <p className="whitespace-pre-wrap text-sm leading-relaxed text-slate-800">{displayText}</p>
+        <p className="whitespace-pre-wrap text-sm leading-relaxed text-slate-800 dark:text-slate-200">
+          {displayText}
+        </p>
       )}
       {enText && enText !== displayText && (
-        <details className="mt-2 text-xs text-slate-500">
-          <summary className="cursor-pointer hover:text-slate-700">英文原文</summary>
-          <p className="mt-1 whitespace-pre-wrap text-slate-600">{enText}</p>
+        <details className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+          <summary className="cursor-pointer hover:text-slate-700 dark:hover:text-slate-300">英文原文</summary>
+          <p className="mt-1 whitespace-pre-wrap text-slate-600 dark:text-slate-400">{enText}</p>
         </details>
       )}
       {card.faces.length > 1 && (
-        <div className="mt-3 space-y-2 border-t border-slate-100 pt-3">
-          <div className="text-xs font-medium text-slate-500">其他牌面</div>
+        <div className="mt-3 space-y-2 border-t border-slate-100 pt-3 dark:border-slate-800">
+          <div className="text-xs font-medium text-slate-500 dark:text-slate-400">其他牌面</div>
           {card.faces.slice(1).map((f, i) => (
             <div key={i} className="text-sm">
               <div className="flex items-baseline gap-2">
-                <span className="font-medium text-slate-800">
+                <span className="font-medium text-slate-800 dark:text-slate-200">
                   {f.face_name_zh || f.face_name}
                 </span>
-                {f.mana_cost && <span className="font-mono text-xs text-slate-500">{f.mana_cost}</span>}
+                {f.mana_cost && (
+                  <span className="font-mono text-xs text-slate-500 dark:text-slate-400">{f.mana_cost}</span>
+                )}
               </div>
               {(f.translated_type || f.type_line) && (
-                <div className="text-xs text-slate-500">{f.translated_type || f.type_line}</div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  {f.translated_type || f.type_line}
+                </div>
               )}
               {(f.translated_text || f.oracle_text) && (
-                <p className="mt-1 whitespace-pre-wrap text-slate-700">
+                <p className="mt-1 whitespace-pre-wrap text-slate-700 dark:text-slate-300">
                   {f.translated_text || f.oracle_text}
                 </p>
               )}
@@ -65,12 +70,14 @@ export function CardCard({ card }: CardCardProps) {
         </div>
       )}
       {card.rulings.length > 0 && (
-        <details className="mt-3 border-t border-slate-100 pt-2 text-xs text-slate-600">
-          <summary className="cursor-pointer hover:text-slate-800">官方裁定 {card.rulings.length} 条</summary>
+        <details className="mt-3 border-t border-slate-100 pt-2 text-xs text-slate-600 dark:border-slate-800 dark:text-slate-300">
+          <summary className="cursor-pointer hover:text-slate-800 dark:hover:text-slate-100">
+            官方裁定 {card.rulings.length} 条
+          </summary>
           <ul className="mt-2 space-y-2">
             {card.rulings.map((r, i) => (
-              <li key={i} className="rounded bg-slate-50 px-2 py-1.5">
-                {r.date && <span className="mr-2 text-slate-400">{r.date}</span>}
+              <li key={i} className="rounded bg-slate-50 px-2 py-1.5 dark:bg-slate-800/60">
+                {r.date && <span className="mr-2 text-slate-400 dark:text-slate-500">{r.date}</span>}
                 <span>{r.text}</span>
               </li>
             ))}

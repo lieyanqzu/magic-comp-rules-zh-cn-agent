@@ -5,8 +5,25 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>万智牌中文规则裁判</title>
+    <script>
+      // 防 FOUC：在 React 挂载前同步把 .dark 类应用上
+      (function () {
+        try {
+          var raw = localStorage.getItem('mtg-judge-theme-v1');
+          var pref = raw === 'light' || raw === 'dark' || raw === 'system' ? raw : 'system';
+          var dark =
+            pref === 'dark' ||
+            (pref === 'system' &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          if (dark) document.documentElement.classList.add('dark');
+          document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
+        } catch (_) {
+          /* ignore */
+        }
+      })();
+    </script>
   </head>
-  <body class="bg-slate-50 text-slate-900 antialiased">
+  <body class="bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

@@ -36,17 +36,17 @@ export function Drawer({ open, onClose, title, children }: DrawerProps) {
         ref={ref}
         role="dialog"
         aria-label={title}
-        className={`absolute right-0 top-0 flex h-full w-full max-w-md flex-col border-l border-slate-200 bg-white shadow-2xl transition-transform ${
+        className={`absolute right-0 top-0 flex h-full w-full max-w-md flex-col border-l border-slate-200 bg-white shadow-2xl transition-transform dark:border-slate-800 dark:bg-slate-950 ${
           open ? 'translate-x-0' : 'translate-x-full'
         }`}
       >
-        <header className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
-          <h2 className="text-base font-semibold text-slate-900">{title}</h2>
+        <header className="flex items-center justify-between border-b border-slate-100 px-5 py-4 dark:border-slate-800">
+          <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">{title}</h2>
           <button
             type="button"
             onClick={onClose}
             aria-label="关闭"
-            className="rounded-md p-1.5 text-slate-500 hover:bg-slate-100 hover:text-slate-900"
+            className="rounded-md p-1.5 text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
           >
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M6 6L18 18M6 18L18 6" strokeLinecap="round" />
