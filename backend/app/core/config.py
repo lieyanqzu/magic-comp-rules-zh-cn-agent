@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     # 自动入库时是否同步生成 embedding（关闭可加快启动，但新增/变更 chunk 没有向量）
     auto_ingest_embeddings: bool = True
 
+    # 前端静态资源目录。设置后 FastAPI 会把它 mount 成 /，配合 SPA history fallback。
+    # 留空则不挂载（开发时前端跑独立 dev server）。生产 Docker 镜像会设为 /app/frontend-dist。
+    frontend_dist_dir: str = ""
+
     @property
     def rules_root_path(self) -> Path:
         return Path(__file__).resolve().parent.parent.parent / self.rules_root_dir
