@@ -85,6 +85,10 @@ TOOLS = [
 # 模块级单例：复用 httpx 连接池，避免每个请求都构造新 client
 _openai_client: AsyncOpenAI | None = None
 
+# 部分第三方兼容网关的 WAF 会按 SDK 默认 UA（OpenAI/Python、AsyncOpenAI/Python）
+# 直接 403。用中性 UA 绕过，对官方端点也无副作用。
+_NEUTRAL_USER_AGENT = "mtg-judge-agent/1.0"
+
 
 def get_openai_client() -> AsyncOpenAI:
     global _openai_client
@@ -95,6 +99,7 @@ def get_openai_client() -> AsyncOpenAI:
             timeout=httpx.Timeout(
                 connect=10, read=settings.llm_request_timeout, write=10, pool=10
             ),
+            default_headers={"User-Agent": _NEUTRAL_USER_AGENT},
         )
     return _openai_client
 
@@ -112,6 +117,7 @@ def _build_client(api_key: str | None, base_url: str | None) -> AsyncOpenAI:
         timeout=httpx.Timeout(
             connect=10, read=settings.llm_request_timeout, write=10, pool=10
         ),
+        default_headers={"User-Agent": _NEUTRAL_USER_AGENT},
     )
 
 
