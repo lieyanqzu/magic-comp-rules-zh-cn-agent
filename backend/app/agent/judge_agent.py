@@ -131,6 +131,30 @@ def _event(event_type: str, **data: object) -> dict:
     return {"type": event_type, **data}
 
 
+def _extract_json(raw: str) -> str:
+    """从模型输出里提取 JSON 字符串。
+
+    即使开了 response_format=json_object，部分上游（DeepSeek、豆包某些版本）
+    仍会返回 markdown 围栏或前后多余文字。剥掉常见包装后再交给 json.loads，
+    解析成功率比 strict 模式高一截，且不会误改本身合法的 JSON。
+    """
+    s = raw.strip()
+    # 去掉 ```json ... ``` 或 ``` ... ``` 围栏
+    if s.startswith("```"):
+        s = s[3:]
+        if s[:4].lower() == "json":
+            s = s[4:]
+        s = s.lstrip("\r\n ")
+        if s.endswith("```"):
+            s = s[:-3].rstrip()
+    # 取第一个 { 到最后一个 }，丢弃前后说明文字
+    start = s.find("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return s[start : end + 1]
+    return s
+
+
 # 哪些异常需要重试（瞬时错误）
 _RETRYABLE_TYPES = (RateLimitError, APIConnectionError, httpx.TimeoutException)
 
@@ -489,7 +513,7 @@ class JudgeAgent:
 
     def _parse_response(self, raw_content: str, tool_cards: list[dict], tool_rules: list[dict]) -> JudgeResponse:
         try:
-            data = json.loads(raw_content)
+            data = json.loads(_extract_json(raw_content))
         except json.JSONDecodeError:
             logger.warning(
                 "LLM 返回非 JSON 内容", content=raw_content[:200], request_id=self.request_id
