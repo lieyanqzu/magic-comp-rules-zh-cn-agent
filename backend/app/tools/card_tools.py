@@ -156,8 +156,13 @@ async def resolve_card_name(input_name: str) -> dict | None:
     if faces:
         result["faces"] = faces
     if rulings_raw:
+        # mtgch 同时返回 comment（英文原文）和 translation（官方中文翻译），
+        # 优先用中文喂给 LLM；缺翻译时再回退到英文。
         result["rulings"] = [
-            {"date": r.get("published_at", ""), "text": r.get("comment", "")}
+            {
+                "date": r.get("published_at", ""),
+                "text": r.get("translation") or r.get("comment", ""),
+            }
             for r in rulings_raw[:10]
         ]
 
