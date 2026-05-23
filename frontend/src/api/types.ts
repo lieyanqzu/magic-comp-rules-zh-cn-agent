@@ -94,6 +94,27 @@ export interface ToolResultEvent {
   query?: string
   section_id?: string
   results_count?: number
+  /** reranker 给出的最高分（0~1）。null 表示无法获取（rerank 失败 / 无候选） */
+  best_score?: number | null
+  /** 后端基于 best_score 与阈值给出的置信度提示，用于 LLM 决策是否继续检索 */
+  confidence_hint?: 'high' | 'medium' | 'low' | null
+  /**
+   * 重排状态，反映本次分数信号是否可信：
+   * - ok       真实精排
+   * - cached   命中重排或 Redis 检索缓存（信号仍可信）
+   * - fallback API 失败走线性兜底（信号不可信，仅作排序占位）
+   * - disabled reranker_enabled=false（同上）
+   * - no_input 无候选 chunk
+   */
+  rerank_status?: 'ok' | 'cached' | 'fallback' | 'disabled' | 'no_input' | null
+  /** 后端自动扩展的同义词（含原 query 词） */
+  expanded_terms?: string[] | null
+  /** 本次工具调用完成后剩余的工具调用预算 */
+  rounds_left?: number | null
+  /** true = 后端检测到与之前查询参数完全相同，已直接返回缓存（提示 LLM 别重复搜） */
+  duplicated_call?: boolean | null
+  /** true = 已累计足够的高置信命中，本次调用被机制级短路，让 LLM 立即收尾 */
+  high_hit_satisfied?: boolean | null
   // search_cards
   count?: number
   items?: Array<Record<string, unknown>>
@@ -155,6 +176,8 @@ export interface LLMOverride {
   apiKey?: string
   baseUrl?: string
   model?: string
+  /** 单次响应最大 token 数。空 / undefined 时使用服务器默认（32000）。 */
+  maxTokens?: number
 }
 
 export interface AppSettings {

@@ -3,6 +3,10 @@ import type { AppSettings } from '../api/types'
 
 const STORAGE_KEY = 'mtg-judge-settings-v1'
 
+// 单次 LLM 响应默认 token 上限。32K 是大多数主流模型（Claude 4.x / GPT-4 系列 / Qwen 等）
+// 都能稳定吐出的范围；过小会让长答案被截断，过大上游会 4xx 拒。
+export const DEFAULT_MAX_TOKENS = 32000
+
 const DEFAULT_SETTINGS: AppSettings = {
   apiKey: '',
   llm: {},

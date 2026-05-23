@@ -30,10 +30,11 @@ logger = get_logger(__name__)
 
 @dataclass(slots=True, frozen=True)
 class LLMOverride:
-    """前端自带的 LLM 配置：来自请求头 X-LLM-Api-Key / X-LLM-Base-URL / X-LLM-Model。
+    """前端自带的 LLM 配置：来自请求头 X-LLM-Api-Key / X-LLM-Base-URL / X-LLM-Model / X-LLM-Max-Tokens。
 
     安全性：
     - api_key / base_url / model 任何字段都不会写日志或入库。
+    - max_tokens 是非敏感的数值参数，但与上面三项同源，统一用 LLMOverride 管理。
     - __repr__ 强制脱敏，防止误入 traceback / structlog 上下文。
     - 任意字段为 None 表示该字段沿用服务器默认值。
     """
@@ -41,13 +42,18 @@ class LLMOverride:
     api_key: str | None = None
     base_url: str | None = None
     model: str | None = None
+    max_tokens: int | None = None
 
     def is_active(self) -> bool:
+        return any([self.api_key, self.base_url, self.model, self.max_tokens])
+
+    def is_byok(self) -> bool:
+        """仅判断是否带了用户自带 LLM 凭证（影响缓存与日志策略）。max_tokens 不算 BYOK。"""
         return any([self.api_key, self.base_url, self.model])
 
     def __repr__(self) -> str:  # pragma: no cover - safety guard
         # 永远不暴露任何字段值，即使是 base_url / model 也属于用户自定义信息
-        return f"LLMOverride(active={self.is_active()})"
+        return f"LLMOverride(byok={self.is_byok()}, max_tokens={'set' if self.max_tokens else 'default'})"
 
 
 # 用户启用 BYOK 时写入 judge_queries.model 的占位值，不存任何用户自定义内容
@@ -101,12 +107,13 @@ class JudgeService:
             self.searcher,
             client=client,
             model=self.llm_override.model,
+            max_tokens=self.llm_override.max_tokens,
             request_id=self.request_id,
         )
 
     async def _read_llm_cache(self, question: str, language: str) -> JudgeResponse | None:
         # 用户自带 LLM 时跳过缓存：不同 key/model 的回答可能不同，且不应让一个用户读到另一个用户的结果
-        if self.llm_override.is_active():
+        if self.llm_override.is_byok():
             return None
         if not (settings.llm_cache_enabled and self.redis):
             return None
@@ -122,7 +129,7 @@ class JudgeService:
 
     async def _write_llm_cache(self, question: str, language: str, response: JudgeResponse) -> None:
         # 同上，用户自带 LLM 时不写共享缓存
-        if self.llm_override.is_active():
+        if self.llm_override.is_byok():
             return
         if not (settings.llm_cache_enabled and self.redis):
             return
@@ -233,7 +240,8 @@ class JudgeService:
         永不入库 api_key / base_url / 用户提供的 model 名。
         """
         # BYOK 启用时一律写占位符，不区分用户具体覆盖了哪些字段（任意字段都视为隐私）
-        model_for_log = _BYOK_MARKER if self.llm_override.is_active() else settings.openai_model
+        # max_tokens 是非敏感数值，不会触发占位符
+        model_for_log = _BYOK_MARKER if self.llm_override.is_byok() else settings.openai_model
         try:
             async with async_session_factory() as db:
                 db.add(

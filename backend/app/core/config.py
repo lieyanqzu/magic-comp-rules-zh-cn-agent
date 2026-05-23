@@ -57,12 +57,29 @@ class Settings(BaseSettings):
     llm_max_retries: int = 3
     llm_retry_min_wait: float = 1.0
     llm_retry_max_wait: float = 10.0
+    # 单次响应的 max_tokens 上限。上游（OpenAI/Claude/各种网关）对此值有自己的硬上限，
+    # 这里只是默认值，前端可通过 X-LLM-Max-Tokens 覆盖。给得太小会让长答案被截断（已观测）
+    # 给得太大会触发 provider 4xx；32K 是大多数生产模型的合理上限。
+    llm_max_tokens: int = 32000
     sse_heartbeat_interval: float = 15.0  # SSE 心跳间隔（秒）
 
     # 检索配置
-    retrieval_rrf_k: int = 60  # RRF 融合常数
+    retrieval_rrf_k: int = 60  # RRF 融合常数（无 reranker 时的兜底融合）
     retrieval_cache_ttl: int = 300  # 检索结果 Redis 缓存 TTL（秒）
     retrieval_cache_enabled: bool = True
+    # 单路召回数：reranker 启用时建议 50，靠它精排；关闭时建议 30 减少 PG 压力
+    retrieval_recall_per_branch: int = 50
+    # 重排后置信度阈值，影响返回给 LLM 的 confidence_hint
+    retrieval_high_threshold: float = 0.7
+    retrieval_low_threshold: float = 0.4
+
+    # Reranker（精排）配置：在 hybrid_search 召回后用 cross-encoder 重排
+    reranker_enabled: bool = True
+    reranker_api_key: str = ""  # 留空时回落到 embedding_api_key → openai_api_key
+    reranker_base_url: str = ""  # 留空时回落到 embedding_base_url → openai_base_url
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    reranker_timeout: float = 8.0
+    reranker_cache_size: int = 256  # 进程内 LRU 大小
 
     # LLM 响应缓存
     llm_cache_enabled: bool = False
@@ -73,6 +90,9 @@ class Settings(BaseSettings):
     auto_ingest_on_startup: bool = False
     # 自动入库时是否同步生成 embedding（关闭可加快启动，但新增/变更 chunk 没有向量）
     auto_ingest_embeddings: bool = True
+    # 入库前是否清洗规则文本（去英文镜像行 / HTML 标签 / 内部链接），仅作用于 cr 文档。
+    # 切换此开关会让所有 cr chunk 的 content_hash 变化，下次入库会全量重新生成 embedding。
+    cleanup_text_on_ingest: bool = True
 
     # 前端静态资源目录。设置后 FastAPI 会把它 mount 成 /，配合 SPA history fallback。
     # 留空则不挂载（开发时前端跑独立 dev server）。生产 Docker 镜像会设为 /app/frontend-dist。

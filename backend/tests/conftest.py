@@ -8,6 +8,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import JSON, TypeDecorator
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.core.config import settings
 from app.db.models import Base
 from app.db.session import get_db
 from app.main import create_app
@@ -21,6 +22,16 @@ test_session_factory = async_sessionmaker(test_engine, class_=AsyncSession, expi
 class JsonFallback(TypeDecorator):
     impl = JSON
     cache_ok = True
+
+
+@pytest.fixture(autouse=True)
+def _disable_external_retrieval_apis(monkeypatch):
+    """测试不应触发真实 reranker / embedding 网络请求。
+
+    即便环境里有 .env 配了真 key，也强制走 fallback 路径，
+    保证测试用例对依赖外部服务零耦合。
+    """
+    monkeypatch.setattr(settings, "reranker_enabled", False)
 
 
 @pytest.fixture(autouse=True)

@@ -22,7 +22,7 @@ class RuleService:
         top_k: int = 10,
         vector_query: str | None = None,
     ) -> list[RuleResult]:
-        chunks = await self.searcher.search(
+        ranked = await self.searcher.search(
             query=query,
             section_id=section_id,
             document_types=document_types,
@@ -31,11 +31,12 @@ class RuleService:
         )
         return [
             RuleResult(
-                section_id=chunk.section_id,
-                title=chunk.title,
-                content=chunk.content,
-                source_path=chunk.source_path,
-                document_type=chunk.document_type,
+                section_id=r.chunk.section_id,
+                title=r.chunk.title,
+                content=r.chunk.content,
+                source_path=r.chunk.source_path,
+                document_type=r.chunk.document_type,
+                score=round(r.score, 4),
             )
-            for chunk in chunks
+            for r in ranked
         ]

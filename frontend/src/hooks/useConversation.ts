@@ -109,7 +109,7 @@ function toolLabel(tool: string): string {
     {
       resolve_card: '查询牌张',
       search_rules: '检索规则',
-      search_cards: '搜索牌库',
+      search_cards: '搜索牌张',
     }[tool] ?? tool
   )
 }
@@ -133,12 +133,55 @@ function summarizeResult(event: ToolResultEvent): string {
     if (event.name) return `已获取「${event.name}」`
     return '完成'
   }
-  if (event.tool === 'search_rules') return `命中 ${event.results_count ?? 0} 条`
+  if (event.tool === 'search_rules') {
+    return summarizeSearchRules(event)
+  }
   if (event.tool === 'search_cards') {
     if (event.status === 'empty') return '无结果'
     return `命中 ${event.count ?? 0} 张`
   }
   return '完成'
+}
+
+function summarizeSearchRules(event: ToolResultEvent): string {
+  const parts: string[] = []
+  // 各种短路状态优先：高亮异常路径，便于一眼看到"为什么本次没真搜"
+  if (event.high_hit_satisfied) {
+    parts.push('已满足高置信，跳过搜索')
+  } else if (event.duplicated_call) {
+    parts.push('已复用上次结果')
+  } else {
+    parts.push(`命中 ${event.results_count ?? 0} 条`)
+  }
+  // 分数 + 置信度（带颜色暗示由 ThinkingTrace 处理）
+  if (typeof event.best_score === 'number' && !event.high_hit_satisfied) {
+    parts.push(`分数 ${event.best_score.toFixed(2)}`)
+  }
+  if (event.confidence_hint && !event.high_hit_satisfied) {
+    parts.push(CONFIDENCE_LABEL[event.confidence_hint] ?? event.confidence_hint)
+  }
+  // 重排兜底也要露出来 — 真精排时不打扰
+  if (event.rerank_status && event.rerank_status !== 'ok' && event.rerank_status !== 'cached') {
+    parts.push(`重排：${RERANK_STATUS_LABEL[event.rerank_status] ?? event.rerank_status}`)
+  }
+  if (typeof event.rounds_left === 'number') {
+    parts.push(`剩 ${event.rounds_left} 轮`)
+  }
+  return parts.join(' · ')
+}
+
+const CONFIDENCE_LABEL: Record<NonNullable<ToolResultEvent['confidence_hint']>, string> = {
+  high: '高置信',
+  medium: '中置信',
+  low: '低置信',
+}
+
+const RERANK_STATUS_LABEL: Record<NonNullable<ToolResultEvent['rerank_status']>, string> = {
+  ok: '精排',
+  cached: '缓存',
+  fallback: '兜底（API 失败）',
+  disabled: '已关闭',
+  no_input: '无输入',
 }
 
 /**

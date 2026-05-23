@@ -170,7 +170,7 @@ async def resolve_card_name(input_name: str) -> dict | None:
 
 
 async def search_cards(query: str, page: int = 1) -> dict | None:
-    """按条件搜索牌库。
+    """按条件搜索牌张。
 
     支持 Scryfall 风格语法：
     - pow=2 tou=3 力量=2 防御力=3

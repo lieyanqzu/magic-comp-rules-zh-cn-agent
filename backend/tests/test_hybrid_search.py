@@ -72,9 +72,11 @@ async def test_hybrid_search_section_id_priority(db) -> None:
     ])
     await db.commit()
 
-    chunks = await hybrid_search(db, query="完全不相关", section_id="613.1a", top_k=3)
-    assert len(chunks) >= 1
-    assert chunks[0].section_id == "613.1a"
+    ranked = await hybrid_search(db, query="完全不相关", section_id="613.1a", top_k=3)
+    assert len(ranked) >= 1
+    assert ranked[0].chunk.section_id == "613.1a"
+    # reranker 关闭时 fallback 给 0.5~1.0 区间分数
+    assert 0.0 <= ranked[0].score <= 1.0
 
 
 @pytest.mark.asyncio
@@ -86,13 +88,53 @@ async def test_hybrid_search_keyword_returns_results(db) -> None:
     ])
     await db.commit()
 
-    chunks = await hybrid_search(db, query="层系统", top_k=5)
-    ids = [c.id for c in chunks]
+    ranked = await hybrid_search(db, query="层系统", top_k=5)
+    ids = [r.chunk.id for r in ranked]
     assert 10 in ids
 
 
 @pytest.mark.asyncio
 async def test_hybrid_search_empty_query(db) -> None:
-    """空 query + 无 section_id 应返回空。"""
-    chunks = await hybrid_search(db, query="", top_k=5)
-    assert chunks == []
+    """空 query + 无 section_id 应返回空结果。"""
+    ranked = await hybrid_search(db, query="", top_k=5)
+    assert len(ranked) == 0
+    assert ranked.rerank_status == "no_input"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_returns_scores_in_descending_order(db) -> None:
+    """无 reranker 时 fallback 给的分数也应保持降序，方便上层判断 best_score。"""
+    db.add_all([
+        _chunk(20, section_id="400.1", title="层", content="相关内容 1"),
+        _chunk(21, section_id="400.2", title="层", content="相关内容 2"),
+        _chunk(22, section_id="400.3", title="层", content="相关内容 3"),
+    ])
+    await db.commit()
+
+    ranked = await hybrid_search(db, query="层", top_k=10)
+    if len(ranked) >= 2:
+        scores = [r.score for r in ranked]
+        assert scores == sorted(scores, reverse=True)
+
+
+@pytest.mark.asyncio
+async def test_safe_db_branch_isolates_failure(db) -> None:
+    """一个分支内部抛异常时，hybrid_search 整体仍能继续，不会让 session 卡死。
+
+    模拟方式：mock search_by_keyword 让它抛异常，确认 hybrid_search 仍返回
+    HybridSearchResult（即便结果为空），且后续调用不被污染。
+    """
+    db.add(_chunk(30, section_id="500.1", title="层系统", content="层 1 内容"))
+    await db.commit()
+
+    with patch(
+        "app.retrieval.hybrid_search.search_by_keyword",
+        new=AsyncMock(side_effect=RuntimeError("模拟 SQL 失败")),
+    ):
+        result = await hybrid_search(db, query="层", top_k=5)
+    # 关键词分支挂了，整体仍应返回（向量分支因 embedding 服务不可用也是 0）
+    assert hasattr(result, "rerank_status")
+    # 同一 session 之后还能正常用：再发一次不挂的请求
+    result2 = await hybrid_search(db, query="完全不相关 xyz", top_k=5)
+    assert hasattr(result2, "rerank_status")
+

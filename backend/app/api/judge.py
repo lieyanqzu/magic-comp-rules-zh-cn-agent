@@ -31,10 +31,12 @@ def _llm_override_from_headers(
     api_key: str | None,
     base_url: str | None,
     model: str | None,
+    max_tokens: str | None,
 ) -> LLMOverride:
     """构造 LLMOverride 时去除空白；不打日志、不带 header 值。
 
     安全注意：返回的对象会传给 service 层；任何异常路径都不应让 header 值进 logger。
+    max_tokens 是非敏感数值，但解析失败时静默忽略，避免恶意 header 造成 500。
     """
 
     def _clean(s: str | None) -> str | None:
@@ -43,7 +45,25 @@ def _llm_override_from_headers(
         s = s.strip()
         return s or None
 
-    return LLMOverride(api_key=_clean(api_key), base_url=_clean(base_url), model=_clean(model))
+    def _parse_int(s: str | None) -> int | None:
+        cleaned = _clean(s)
+        if cleaned is None:
+            return None
+        try:
+            v = int(cleaned)
+        except ValueError:
+            return None
+        # 合法范围：[1, 1_000_000]。上限给得很宽，由上游 LLM provider 自己 4xx 拒掉过大值
+        if v < 1 or v > 1_000_000:
+            return None
+        return v
+
+    return LLMOverride(
+        api_key=_clean(api_key),
+        base_url=_clean(base_url),
+        model=_clean(model),
+        max_tokens=_parse_int(max_tokens),
+    )
 
 
 @router.post("/ask", response_model=JudgeResponse)
@@ -55,6 +75,7 @@ async def ask_judge(
     x_llm_api_key: str | None = Header(None, alias="X-LLM-Api-Key"),
     x_llm_base_url: str | None = Header(None, alias="X-LLM-Base-URL"),
     x_llm_model: str | None = Header(None, alias="X-LLM-Model"),
+    x_llm_max_tokens: str | None = Header(None, alias="X-LLM-Max-Tokens"),
 ) -> JudgeResponse:
     """非流式接口，返回完整结构化回答。
 
@@ -62,11 +83,13 @@ async def ask_judge(
     - X-LLM-Api-Key：覆盖服务器 OPENAI_API_KEY
     - X-LLM-Base-URL：覆盖 base url（如使用 azure / 第三方代理）
     - X-LLM-Model：覆盖模型名
+    - X-LLM-Max-Tokens：覆盖单次响应 max_tokens（整数；非敏感参数）
 
-    任意一项设置后，该次请求绕过共享 LLM 缓存；服务器不会记录这些字段任何明文。
+    api_key/base_url/model 任意一项设置后，该次请求绕过共享 LLM 缓存；
+    服务器不会记录这些字段任何明文。max_tokens 是数值参数，不影响缓存与日志策略。
     """
     request_id = req.headers.get("x-request-id") or uuid.uuid4().hex[:16]
-    override = _llm_override_from_headers(x_llm_api_key, x_llm_base_url, x_llm_model)
+    override = _llm_override_from_headers(x_llm_api_key, x_llm_base_url, x_llm_model, x_llm_max_tokens)
     service = JudgeService(db, redis=redis, request_id=request_id, llm_override=override)
     history = [m.model_dump() for m in request.history] if request.history else None
     return await service.ask(question=request.question, language=request.language, history=history)
@@ -118,13 +141,14 @@ async def stream_judge(
     x_llm_api_key: str | None = Header(None, alias="X-LLM-Api-Key"),
     x_llm_base_url: str | None = Header(None, alias="X-LLM-Base-URL"),
     x_llm_model: str | None = Header(None, alias="X-LLM-Model"),
+    x_llm_max_tokens: str | None = Header(None, alias="X-LLM-Max-Tokens"),
 ) -> StreamingResponse:
     """流式接口（SSE），逐步返回推理过程和工具调用。
 
-    可选请求头同 /ask（X-LLM-Api-Key / X-LLM-Base-URL / X-LLM-Model）。
+    可选请求头同 /ask（X-LLM-Api-Key / X-LLM-Base-URL / X-LLM-Model / X-LLM-Max-Tokens）。
     """
     request_id = req.headers.get("x-request-id") or uuid.uuid4().hex[:16]
-    override = _llm_override_from_headers(x_llm_api_key, x_llm_base_url, x_llm_model)
+    override = _llm_override_from_headers(x_llm_api_key, x_llm_base_url, x_llm_model, x_llm_max_tokens)
     service = JudgeService(db, redis=redis, request_id=request_id, llm_override=override)
     history = [m.model_dump() for m in request.history] if request.history else None
 

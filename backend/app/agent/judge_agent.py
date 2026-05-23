@@ -5,11 +5,14 @@
 - AsyncOpenAI client 单例复用：避免每次请求构造新连接池。
 - LLM 调用 tenacity 重试：429/5xx 自动指数退避。
 - 输出 token 用量、tool 轮次到事件流，便于 service 层入库统计。
+- 工具结果带 confidence_hint / rounds_left / 已查询历史摘要，让 LLM 自主决策是否继续检索，
+  避免"top1 不沾边就盲目重试"的循环。
 """
 
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -27,6 +30,8 @@ from app.core.config import settings
 from app.core.errors import LLMError
 from app.core.logging import get_logger
 from app.retrieval.hybrid_search import RuleSearcher
+from app.retrieval.query_expand import expand_query, section_hints_for
+from app.retrieval.reranker import confidence_hint_from
 from app.tools.card_tools import resolve_card_name, search_cards
 from app.tools.rule_tools import extract_rule_numbers
 
@@ -49,12 +54,22 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_rules",
-            "description": "检索万智牌规则文档。支持精确规则编号匹配和关键词检索。可以多次调用，每次用不同的关键词覆盖不同机制。",
+            "description": (
+                "检索万智牌规则文档。一次调用即可拿到带相关度分数的 TopK，"
+                "不要为同一意图重复调用。返回结果包含："
+                "matches[].score (0~1 reranker 分数)、best_score、"
+                "confidence_hint (high≥0.7 / medium 0.4~0.7 / low<0.4)、"
+                "rounds_left (剩余可用工具调用次数)、expanded_terms (后端自动扩展的同义词)、"
+                "search_history (本对话里已发起过的查询)。"
+                "决策原则：confidence_hint=high 时直接基于结果作答，不要再搜；"
+                "medium 时若需补充其他角度可继续搜；low 时换关键词或文档类型再试一次，"
+                "但相同 (query, section_id) 会被去重，重复调用属于浪费。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "空格分隔的精炼中文术语（如'运土'、'消灭 坟墓场'、'层 持续效应'），不要用长句"},
-                    "section_id": {"type": "string", "description": "精确规则编号（如 613.1a）"},
+                    "query": {"type": "string", "description": "空格分隔的精炼中文术语（如 '层 持续效应'、'消灭 坟墓场'），不要用长句。后端会自动做同义词扩展。"},
+                    "section_id": {"type": "string", "description": "精确规则编号（如 613.1a）。已知编号时优先用此参数，置信度直接拉满。"},
                     "document_types": {
                         "type": "array",
                         "items": {"type": "string", "enum": ["cr", "reference", "mtr", "ipg"]},
@@ -69,7 +84,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_cards",
-            "description": "按条件搜索牌库。支持 Scryfall 风格语法，如 pow=2 tou=3 c:ug t:creature o:trample mv=3 e:mom lang:zhs。当用户要求按属性筛选牌张时调用。",
+            "description": "按条件搜索牌张。支持 Scryfall 风格语法，如 pow=2 tou=3 c:ug t:creature o:trample mv=3 e:mom lang:zhs。当用户要求按属性筛选牌张时调用。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -185,6 +200,10 @@ class JudgeAgent:
         request_id: 用于贯穿日志的 trace id。
     """
 
+    # 累计高置信度命中次数达到此值后，下一次 search_rules 调用直接短路返回提示。
+    # 实测中 LLM 在 prompt 层规则下仍可能反复换措辞调用同主题搜索，机制级保护更稳。
+    _HIGH_HIT_LIMIT: int = 1
+
     def __init__(
         self,
         searcher: RuleSearcher,
@@ -193,6 +212,7 @@ class JudgeAgent:
         max_tool_rounds: int | None = None,
         temperature: float | None = None,
         model: str | None = None,
+        max_tokens: int | None = None,
         request_id: str | None = None,
     ) -> None:
         self.searcher = searcher
@@ -202,6 +222,8 @@ class JudgeAgent:
         self.temperature = temperature if temperature is not None else settings.llm_temperature
         # 允许 service 层注入用户自带 model 覆盖默认值
         self.model = model or settings.openai_model
+        # max_tokens：前端可通过 X-LLM-Max-Tokens 覆盖；None 时用服务器默认
+        self.max_tokens = max_tokens or settings.llm_max_tokens
         self.request_id = request_id
 
         # 累计 token / 轮次，service 层可读取入库
@@ -209,6 +231,19 @@ class JudgeAgent:
         self.completion_tokens = 0
         self.total_tokens = 0
         self.tool_rounds = 0
+
+        # 检索去重：(query_norm, section_id, doc_types_key) → 上次工具结果 dict
+        # 命中时直接返回缓存 + 标记 duplicated_call=True，告诉 LLM 别再重复同一意图
+        self._search_history: dict[tuple[str, str, str], dict] = {}
+        # 摘要清单（保留发起顺序）：每条 {"query","section_id","doc_types","best_score","top_section_ids"}
+        self._search_summary: list[dict] = []
+
+    @staticmethod
+    def _search_key(query: str, section_id: str | None, doc_types: list[str] | None) -> tuple[str, str, str]:
+        norm_query = " ".join((query or "").split()).lower()
+        norm_sid = (section_id or "").strip()
+        norm_dt = ",".join(sorted(doc_types)) if doc_types else ""
+        return norm_query, norm_sid, norm_dt
 
     async def _llm_call(self, *, messages: list, tools: list | None = None, force_no_tools: bool = False):
         """LLM 调用 + tenacity 指数退避重试。
@@ -220,6 +255,7 @@ class JudgeAgent:
             "messages": messages,
             "response_format": {"type": "json_object"},
             "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
         }
         if tools and not force_no_tools:
             kwargs["tools"] = tools
@@ -260,9 +296,13 @@ class JudgeAgent:
         raise LLMError("LLM 调用未返回响应")
 
     async def _execute_tool(
-        self, name: str, arguments: dict, original_question: str = ""
+        self, name: str, arguments: dict, original_question: str = "", *, rounds_left: int = 0
     ) -> tuple[str, dict | None]:
-        """执行工具，返回 (原始结果字符串, 额外元数据)。"""
+        """执行工具，返回 (原始结果字符串, 额外元数据)。
+
+        rounds_left: 当前 tool_call 完成后 LLM 还能调几次工具（不含本次）。
+            会被注入到 search_rules 的返回里，让 LLM 据此判断是否继续检索。
+        """
         if name == "resolve_card":
             card_name = arguments.get("card_name", "")
             result = await resolve_card_name(card_name)
@@ -286,45 +326,8 @@ class JudgeAgent:
                 return json.dumps(data, ensure_ascii=False, default=str), data
             return json.dumps({"found": False, "name": card_name}, ensure_ascii=False), None
         if name == "search_rules":
-            query = arguments.get("query", "")
-            section_id = arguments.get("section_id")
-            doc_types = arguments.get("document_types")
-            chunks = await self.searcher.search(
-                query=query,
-                section_id=section_id,
-                document_types=doc_types,
-                top_k=10,
-                vector_query=original_question,
-            )
-            results = [
-                {
-                    "section_id": c.section_id,
-                    "title": c.title[:100],
-                    "content": c.content[:300],
-                    "source_path": c.source_path,
-                    "document_type": c.document_type,
-                }
-                for c in chunks
-            ]
-            # 完整版（不截断）保留给最终结构化回答用
-            full_chunks = [
-                {
-                    "section_id": c.section_id,
-                    "title": c.title,
-                    "content": c.content,
-                    "source_path": c.source_path,
-                    "document_type": c.document_type,
-                }
-                for c in chunks
-            ]
-            return (
-                json.dumps(results, ensure_ascii=False),
-                {
-                    "query": query,
-                    "section_id": section_id,
-                    "results_count": len(results),
-                    "chunks": full_chunks,
-                },
+            return await self._execute_search_rules(
+                arguments, original_question=original_question, rounds_left=rounds_left
             )
         if name == "search_cards":
             query = arguments.get("query", "")
@@ -333,6 +336,221 @@ class JudgeAgent:
                 return json.dumps(result, ensure_ascii=False, default=str), result
             return json.dumps({"count": 0, "items": [], "query": query}, ensure_ascii=False), None
         return json.dumps({"error": f"未知工具: {name}"}, ensure_ascii=False), None
+
+    async def _execute_search_rules(
+        self,
+        arguments: dict,
+        *,
+        original_question: str,
+        rounds_left: int,
+    ) -> tuple[str, dict | None]:
+        """search_rules 工具实现：召回 + 重排 + 预算/置信度元信息。
+
+        返回给 LLM 的 JSON 包含：
+        - matches: TopK 命中（含 score）
+        - best_score / confidence_hint: 用来判断"是否还需要继续检索"
+        - rounds_left: 剩余工具调用次数
+        - expanded_terms: 后端自动扩展的同义词
+        - search_history: 已发起过的查询摘要（让 LLM 自己看到自己搜过什么）
+        - duplicated_call: 同 (query, section_id, doc_types) 重复时为 True
+        - high_hit_satisfied: 已累计 N 次 high 命中触发的早停短路
+        """
+        query = arguments.get("query", "") or ""
+        section_id = arguments.get("section_id")
+        doc_types = arguments.get("document_types")
+
+        history_summary = list(self._search_summary)  # 拷贝防止下游突变
+        key = self._search_key(query, section_id, doc_types)
+
+        # 重复检索优先于 high 短路：用户/LLM 用了完全相同的 query，
+        # 返回带内容的缓存比一句"够了"对下游更有用。
+        if key in self._search_history:
+            cached = self._search_history[key]
+            payload = {
+                **cached,
+                "duplicated_call": True,
+                "rounds_left": rounds_left,
+                "search_history": history_summary,
+                "note": "本次调用与之前的查询参数完全相同，已返回缓存结果。请基于已有信息作答或换关键词。",
+            }
+            return json.dumps(payload, ensure_ascii=False), {**cached, "duplicated_call": True}
+
+        # 高置信早停：累计 high 次数达到 _HIGH_HIT_LIMIT 后，对**新意图**的 search_rules 调用短路。
+        # 实测中即便 prompt 里写了"high 不要再搜"，LLM 仍可能把已搜过的换措辞再来一次，
+        # 让 plateau 早停在 round 5 才介入并触发 force_no_tools 路径，反而吐空 JSON。
+        # 在工具入口处直接拒绝，让 LLM 在下一轮收尾时看到充分的"够了"信号。
+        high_hit_count = sum(
+            1 for s in self._search_summary if s.get("confidence_hint") == "high"
+        )
+        if high_hit_count >= self._HIGH_HIT_LIMIT:
+            note = (
+                f"已累计 {high_hit_count} 次高置信度（high）检索结果，本次 search_rules 调用被短路。"
+                "请立即基于已有 matches 与你的 MTG 知识给出最终 JSON 回答，"
+                "answer 字段必须非空、引用具体规则编号。禁止再调 search_rules。"
+            )
+            payload = {
+                "query": query,
+                "section_id": section_id,
+                "document_types": doc_types,
+                "matches": [],
+                "results_count": 0,
+                "high_hit_satisfied": True,
+                "high_hit_count": high_hit_count,
+                "rounds_left": rounds_left,
+                "search_history": history_summary,
+                "note": note,
+            }
+            meta = {
+                "high_hit_satisfied": True,
+                "high_hit_count": high_hit_count,
+                "results_count": 0,
+            }
+            return json.dumps(payload, ensure_ascii=False), meta
+
+        ranked = await self.searcher.search(
+            query=query,
+            section_id=section_id,
+            document_types=doc_types,
+            top_k=10,
+            vector_query=original_question,
+        )
+        # 兼容 mock：测试里的 mock 直接返回 list[RerankedChunk]
+        rerank_status = getattr(ranked, "rerank_status", "ok")
+
+        # query 扩展信息，喂给 LLM 看到"我替你扩了什么"
+        expansion = expand_query(query) if query else None
+        expanded_terms = list(expansion.keywords) if expansion else []
+
+        matches: list[dict] = []
+        full_chunks: list[dict] = []
+        for r in ranked:
+            c = r.chunk
+            score = round(r.score, 4)
+            matches.append(
+                {
+                    "section_id": c.section_id,
+                    "title": c.title[:100],
+                    "snippet": c.content[:300],
+                    "source_path": c.source_path,
+                    "document_type": c.document_type,
+                    "score": score,
+                }
+            )
+            full_chunks.append(
+                {
+                    "section_id": c.section_id,
+                    "title": c.title,
+                    "content": c.content,
+                    "source_path": c.source_path,
+                    "document_type": c.document_type,
+                }
+            )
+
+        scores = [r.score for r in ranked]
+        best_score = round(max(scores), 4) if scores else 0.0
+        confidence_hint = confidence_hint_from(scores)
+
+        tool_payload = {
+            "query": query,
+            "section_id": section_id,
+            "document_types": doc_types,
+            "expanded_terms": expanded_terms,
+            "matches": matches,
+            "results_count": len(matches),
+            "best_score": best_score,
+            "confidence_hint": confidence_hint,
+            "rerank_status": rerank_status,
+            "rounds_left": rounds_left,
+            "search_history": history_summary,
+            "duplicated_call": False,
+        }
+
+        # 写入历史，下次同 key 直接命中
+        # 注意：缓存里不带 rounds_left / search_history（这两个是"调用时态"）
+        cacheable = {
+            "query": query,
+            "section_id": section_id,
+            "document_types": doc_types,
+            "expanded_terms": expanded_terms,
+            "matches": matches,
+            "results_count": len(matches),
+            "best_score": best_score,
+            "confidence_hint": confidence_hint,
+            "rerank_status": rerank_status,
+        }
+        self._search_history[key] = cacheable
+        self._search_summary.append(
+            {
+                "query": query,
+                "section_id": section_id,
+                "doc_types": doc_types,
+                "best_score": best_score,
+                "confidence_hint": confidence_hint,
+                "rerank_status": rerank_status,
+                "top_section_ids": [m["section_id"] for m in matches[:3]],
+            }
+        )
+
+        # meta 给 agent 内部用：除 matches/expanded_terms 外，还要带 chunks（不截断的完整版）供回填
+        meta = {
+            **cacheable,
+            "chunks": full_chunks,
+        }
+        return json.dumps(tool_payload, ensure_ascii=False), meta
+
+    async def _prefetch_by_rule_numbers(self, rule_numbers: list[str]) -> list[dict]:
+        """规则号快路径：用户直接报了 613.1a 这种编号时，第一次 LLM 调用前就预拉相关条文。
+
+        每个编号最多取 top 3，并去重；返回与 collected_rules 同形态的 chunk dict。
+        失败 / 空结果时返回空列表，不影响后续流程。
+        """
+        seen_ids: set[str] = set()
+        out: list[dict] = []
+        # 限制最多查 3 个编号，避免有人构造大量编号刷预拉
+        for sid in rule_numbers[:3]:
+            try:
+                ranked = await self.searcher.search(
+                    query="",
+                    section_id=sid,
+                    top_k=3,
+                )
+            except Exception:
+                continue
+            for r in ranked:
+                c = r.chunk
+                key = f"{c.source_path}#{c.section_id}"
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+                out.append(
+                    {
+                        "section_id": c.section_id,
+                        "title": c.title,
+                        "content": c.content,
+                        "source_path": c.source_path,
+                        "document_type": c.document_type,
+                    }
+                )
+        return out
+
+    @staticmethod
+    def _render_prefetch_block(chunks: list[dict]) -> str:
+        """把预检索结果渲染成一段 system message。"""
+        if not chunks:
+            return ""
+        lines = [
+            "[预检索] 已根据用户问题中的规则编号自动加载以下条文，可直接在最终回答中引用，",
+            "通常无需再调用 search_rules（除非需要补充其他角度的规则）。",
+            "",
+        ]
+        for c in chunks:
+            sid = c.get("section_id", "")
+            title = (c.get("title") or "").strip()[:120]
+            content = (c.get("content") or "").strip()[:500]
+            lines.append(f"- {sid} {title}".rstrip())
+            if content:
+                lines.append(f"  {content}")
+        return "\n".join(lines)
 
     async def ask_stream(
         self,
@@ -349,16 +567,37 @@ class JudgeAgent:
         yield _event("start", question=question, request_id=self.request_id)
 
         rule_numbers = extract_rule_numbers(question)
+        term_section_hints = section_hints_for(question)
         if rule_numbers:
             yield _event("thinking", content=f"检测到规则编号：{', '.join(rule_numbers)}，将优先查询。")
 
-        rule_hint = (
-            f"\n\n[系统提示] 检测到规则编号：{', '.join(rule_numbers)}，请优先查询。"
-            if rule_numbers
-            else ""
-        )
+        # 快路径预检索：用户直接报了规则号时，第一轮 LLM 调用前就把相关条文塞进上下文，
+        # 通常能省一整轮 search_rules 的 tool call。命中失败也不影响后续流程。
+        prefetched_chunks: list[dict] = []
+        if rule_numbers:
+            try:
+                prefetched_chunks = await self._prefetch_by_rule_numbers(rule_numbers)
+                if prefetched_chunks:
+                    yield _event(
+                        "thinking",
+                        content=f"已预加载 {len(prefetched_chunks)} 条相关规则，可直接引用。",
+                    )
+            except Exception:
+                logger.warning("规则号预检索失败", request_id=self.request_id)
+
+        # 把预检索结果塞进第一条 system message 后面，避免污染 user 消息（user 内容是用户原话）
+        prefetch_block = self._render_prefetch_block(prefetched_chunks)
+        # 术语 → 章节提示：不预拉数据（避免误导），仅作为 hint 让 LLM 第一次 tool_call 就用对 section_id
+        hint_lines: list[str] = []
+        if rule_numbers:
+            hint_lines.append(f"用户问题中的规则编号：{', '.join(rule_numbers)}")
+        if term_section_hints:
+            hint_lines.append(f"问题涉及的章节候选：{', '.join(term_section_hints)}")
+        rule_hint = ("\n\n[系统提示]\n" + "\n".join(hint_lines)) if hint_lines else ""
 
         messages: list[dict] = [{"role": "system", "content": self.system_prompt}]
+        if prefetch_block:
+            messages.append({"role": "system", "content": prefetch_block})
         # 历史以 user/assistant 朴素文本注入；只保证 role 合法、内容非空
         if history:
             for msg in history:
@@ -371,14 +610,42 @@ class JudgeAgent:
         )
 
         collected_cards: list[dict] = []
-        collected_rules: list[dict] = []
+        collected_rules: list[dict] = list(prefetched_chunks)  # 让 _parse_response 也能回填这些
+
+        # 早停哨兵：连续两次 search_rules 的 best_score 差距 < 阈值时，下一轮强制收尾。
+        # 实测中 LLM 经常无视 prompt 里的"换关键词没用就停"指令，反复刷同分。
+        # 用机制级保护避免 5 轮全跑满后 force_no_tools 触发空答案问题。
+        last_best_score: float | None = None
+        plateau_count = 0
+        PLATEAU_THRESHOLD = 0.05
+        PLATEAU_LIMIT = 2  # 连续 N 次 best_score 无明显提升即触发
 
         for round_idx in range(self.max_tool_rounds):
             self.tool_rounds = round_idx + 1
             yield _event("thinking", content=f"第 {round_idx + 1} 轮推理...")
 
+            force_collapse = plateau_count >= PLATEAU_LIMIT
+            if force_collapse:
+                # 提示模型，告诉它必须基于已有信息收尾
+                yield _event(
+                    "thinking",
+                    content=f"检测到检索分数停滞（连续 {plateau_count} 次无提升），强制基于已有信息收尾。",
+                )
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "检测到连续多轮检索的 best_score 没有明显提升，说明继续搜索不会带来新信息。"
+                            "请立即基于已有 matches + 你的 MTG 知识给出最终 JSON 回答，"
+                            "禁止再调用 search_rules。answer 字段必须非空。"
+                        ),
+                    }
+                )
+
             try:
-                response = await self._llm_call(messages=messages, tools=TOOLS)
+                response = await self._llm_call(
+                    messages=messages, tools=TOOLS, force_no_tools=force_collapse
+                )
             except Exception as e:
                 logger.exception("LLM 调用失败", request_id=self.request_id)
                 yield _event("error", content=f"LLM 调用失败: {e}")
@@ -386,10 +653,16 @@ class JudgeAgent:
 
             choice = response.choices[0]
 
-            if choice.finish_reason == "stop" or not choice.message.tool_calls:
+            # force_collapse 时不论 LLM 是否还返回 tool_calls 都视为最终回答。
+            # 实测中 Claude 在 force_no_tools=True 时偶发仍返回 tool_calls（content 为空），
+            # 不防御会再走一轮工具循环白白消耗预算。
+            if force_collapse or choice.finish_reason == "stop" or not choice.message.tool_calls:
                 yield _event("thinking", content="推理完成，生成最终回答...")
-                parsed = self._parse_response(
-                    choice.message.content or "{}", collected_cards, collected_rules
+                parsed = await self._parse_response_with_repair(
+                    choice.message.content or "{}",
+                    messages,
+                    collected_cards,
+                    collected_rules,
                 )
                 yield _event("answer", data=parsed.model_dump())
                 return
@@ -404,10 +677,17 @@ class JudgeAgent:
                 func_name = tool_call.function.name
                 yield _event("tool_call", tool=func_name, args=func_args)
 
+                # 本次 tool_call 完成后 LLM 还能调几次工具（不含本次）
+                # round_idx 从 0 起，max_tool_rounds 是总轮数，最后一轮调用后剩 0
+                rounds_left_after_this = max(0, self.max_tool_rounds - round_idx - 1)
+
                 meta: dict | None = None
                 try:
                     result_str, meta = await self._execute_tool(
-                        func_name, func_args, original_question=question
+                        func_name,
+                        func_args,
+                        original_question=question,
+                        rounds_left=rounds_left_after_this,
                     )
                 except Exception as e:
                     logger.warning(
@@ -442,16 +722,35 @@ class JudgeAgent:
                         )
                 elif func_name == "search_rules":
                     count = meta.get("results_count", 0) if meta else 0
-                    if meta:
+                    duplicated = bool(meta and meta.get("duplicated_call"))
+                    high_hit_short_circuit = bool(meta and meta.get("high_hit_satisfied"))
+                    if meta and not duplicated and not high_hit_short_circuit:
                         # 累加真实检索结果到 collected_rules，供 _parse_response 用中文回填
+                        # duplicated_call / high_hit_satisfied 时 chunks 不存在或已被前次记录
                         for chunk in meta.get("chunks", []):
                             collected_rules.append(chunk)
+                    # 早停哨兵：跟踪 best_score 的提升幅度
+                    # short-circuit 路径没有真实分数，跳过 plateau 跟踪避免被误判
+                    if meta and not duplicated and not high_hit_short_circuit:
+                        cur_best = meta.get("best_score") or 0.0
+                        if last_best_score is not None and (cur_best - last_best_score) < PLATEAU_THRESHOLD:
+                            plateau_count += 1
+                        else:
+                            plateau_count = 0
+                        last_best_score = cur_best
                     yield _event(
                         "tool_result",
                         tool=func_name,
                         query=func_args.get("query"),
                         section_id=func_args.get("section_id"),
                         results_count=count,
+                        best_score=meta.get("best_score") if meta else None,
+                        confidence_hint=meta.get("confidence_hint") if meta else None,
+                        rerank_status=meta.get("rerank_status") if meta else None,
+                        expanded_terms=meta.get("expanded_terms") if meta else None,
+                        duplicated_call=duplicated,
+                        high_hit_satisfied=high_hit_short_circuit or None,
+                        rounds_left=rounds_left_after_this,
                     )
                 elif func_name == "search_cards":
                     if meta:
@@ -483,14 +782,22 @@ class JudgeAgent:
                 "content": (
                     "已达到最大工具调用轮次，禁止再发起任何工具调用。"
                     "请仅依据上文已收集的信息给出最终 JSON 回答。"
-                    "若信息不足，请将 confidence 标为 low 且在 reasoning_summary 中说明。"
+                    "**强制要求**："
+                    "1) answer 字段必须非空 —— 哪怕只是承认信息不足，也要写出原因和建议（"
+                    "比如\"基于已搜索内容，本助手认为...\"或\"该问题超出当前检索能力，建议咨询人工裁判...\"）。"
+                    "2) summary 字段必须非空（一句话裁判结论）。"
+                    "3) 严禁返回 `{}` 或字段全空的 JSON。"
+                    "4) 若确实信息不足，将 confidence 标为 low，并把 needs_human_judge 设为 true。"
                 ),
             }
         )
         try:
             response = await self._llm_call(messages=messages, force_no_tools=True)
-            parsed = self._parse_response(
-                response.choices[0].message.content or "{}", collected_cards, collected_rules
+            parsed = await self._parse_response_with_repair(
+                response.choices[0].message.content or "{}",
+                messages,
+                collected_cards,
+                collected_rules,
             )
             yield _event("answer", data=parsed.model_dump())
         except Exception as e:
@@ -511,10 +818,118 @@ class JudgeAgent:
                 raise LLMError(event["content"])
         raise LLMError("未生成回答")
 
-    def _parse_response(self, raw_content: str, tool_cards: list[dict], tool_rules: list[dict]) -> JudgeResponse:
+    def _try_parse_json(self, raw_content: str) -> dict | None:
+        """尝试把 LLM 返回的字符串解析成 dict。
+
+        返回 None 触发 salvage：
+        - 空 / 空白输入
+        - JSON 解析失败
+        - 解析成功但**没有任何关键字段**（answer 为空 + summary 为空）—— Claude 在
+          force_no_tools 路径下偶尔会返回 `{}` 或空对象，此时不该当成"空答案"接受。
+        """
+        if not raw_content or not raw_content.strip():
+            return None
         try:
             data = json.loads(_extract_json(raw_content))
         except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        # 关键字段全空视为无效响应
+        if not (data.get("answer") or "").strip() and not (data.get("summary") or "").strip():
+            return None
+        return data
+
+    @staticmethod
+    def _salvage_json(broken_raw: str) -> dict | None:
+        """确定性的 JSON 抢救：当主解析 + extract 都失败时，尝试用正则把关键字段挖出来。
+
+        典型失败模式：
+        - LLM 输出被 max_tokens 截断（JSON 结尾的 `}` 没了）
+        - LLM 在 JSON 之外加了 markdown 段落或多个 `{}` 块
+        - 嵌入的 markdown 富文本里的 \" 或换行没正确转义
+
+        策略：
+        1) 先用宽松正则提取 answer / summary 字段（容忍未闭合引号）
+        2) 提不到就把整个 raw 包成 answer 字段；置信度强制降级到 medium
+        """
+        if not broken_raw or not broken_raw.strip():
+            return None
+
+        # 去掉外层 markdown 围栏（最常见的 ```json ... ```）
+        text = broken_raw.strip()
+        if text.startswith("```"):
+            text = text[3:]
+            if text[:4].lower() == "json":
+                text = text[4:]
+            text = text.lstrip("\r\n ")
+            if text.endswith("```"):
+                text = text[:-3].rstrip()
+
+        # 截断恢复：如果文本看起来是被截断的 JSON（缺末尾 `}`），强行补齐再尝试一次
+        if text.startswith("{") and not text.rstrip().endswith("}"):
+            # 数一下未闭合的 { 与未结束的 "
+            # 这是粗糙但实用的启发式 — 不追求 100% 重建合法 JSON
+            for repair_suffix in ('"}', '"]}', '"]"}', '"}]}'):
+                trial = text + repair_suffix
+                try:
+                    parsed = json.loads(trial)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    continue
+
+        # 提取 answer 字段：宽松正则容忍内部转义
+        # 匹配 `"answer"\s*:\s*"(.*?)"\s*,` 或 `,\s*"summary"`
+        answer_match = re.search(
+            r'"answer"\s*:\s*"((?:\\.|[^"\\])*)"',
+            text,
+            flags=re.DOTALL,
+        )
+        summary_match = re.search(
+            r'"summary"\s*:\s*"((?:\\.|[^"\\])*)"',
+            text,
+            flags=re.DOTALL,
+        )
+        confidence_match = re.search(
+            r'"confidence"\s*:\s*"(high|medium|low)"',
+            text,
+        )
+
+        answer_text = ""
+        if answer_match:
+            try:
+                # 把匹配到的字符串当 JSON 字符串字面量解析，处理 \n / \"
+                answer_text = json.loads(f'"{answer_match.group(1)}"')
+            except Exception:
+                answer_text = answer_match.group(1)
+
+        summary_text = summary_match.group(1).strip() if summary_match else ""
+
+        # input 看起来像 JSON 对象（带大括号）但 answer/summary 都是空 →
+        # LLM 实际吐了一个空响应（如 `{}` 或 `{"answer":"","summary":""}`），不该当成成功
+        looks_like_json_object = bool(re.match(r"^\s*\{", text))
+        if looks_like_json_object and not answer_text.strip() and not summary_text:
+            return None
+
+        if not answer_text:
+            # 最后兜底：纯文本输入（如 markdown 散文）整段塞进 answer
+            answer_text = text
+
+        return {
+            "answer": answer_text,
+            "summary": summary_match.group(1) if summary_match else "",
+            "confidence": (confidence_match.group(1) if confidence_match else "medium"),
+            "cards": [],
+            "rules": [],
+            "reasoning_summary": "原始输出未通过 JSON 解析，已自动抢救为结构化结果。",
+            "needs_human_judge": False,
+        }
+
+    def _parse_response(self, raw_content: str, tool_cards: list[dict], tool_rules: list[dict]) -> JudgeResponse:
+        """从 LLM 原始字符串解析 + 构造 JudgeResponse（同步路径，无修复重试）。"""
+        data = self._try_parse_json(raw_content)
+        if data is None:
             logger.warning(
                 "LLM 返回非 JSON 内容", content=raw_content[:200], request_id=self.request_id
             )
@@ -525,6 +940,43 @@ class JudgeAgent:
                 reasoning_summary="模型返回了非 JSON 格式的内容",
                 needs_human_judge=True,
             )
+        return self._build_response_from_data(data, tool_cards, tool_rules)
+
+    async def _parse_response_with_repair(
+        self,
+        raw_content: str,
+        messages: list,
+        tool_cards: list[dict],
+        tool_rules: list[dict],
+    ) -> JudgeResponse:
+        """JSON 契约保护版：主解析失败时走确定性 salvage（正则抢救），不再调 LLM。
+
+        实测多次发现：LLM 修复请求容易把"修复格式"误解为"重新作答"导致幻觉，
+        且原始输出经常已经被 max_tokens 截断，再交给 LLM 也补不回来。
+        改用确定性正则抢救，把 answer 字段挖出来包成最小 envelope。
+        """
+        data = self._try_parse_json(raw_content)
+        if data is None:
+            logger.warning(
+                "LLM 返回非 JSON，启用确定性 salvage",
+                content=raw_content[:200],
+                request_id=self.request_id,
+            )
+            data = self._salvage_json(raw_content)
+        if data is None:
+            return JudgeResponse(
+                answer=raw_content,
+                summary="无法解析为结构化回答",
+                confidence="low",
+                reasoning_summary="模型返回非 JSON 格式且无法抢救。",
+                needs_human_judge=True,
+            )
+        return self._build_response_from_data(data, tool_cards, tool_rules)
+
+    def _build_response_from_data(
+        self, data: dict, tool_cards: list[dict], tool_rules: list[dict]
+    ) -> JudgeResponse:
+        """从已解析的 dict 构造 JudgeResponse，做工具数据回填。"""
 
         # ---- 牌张：以工具数据为权威源 ----
         # 工具数据按 name (中文) 和 oracle_name (英文) 双索引，便于 LLM 用任一形式引用都能匹配

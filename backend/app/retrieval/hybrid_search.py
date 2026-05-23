@@ -1,9 +1,18 @@
-"""混合检索：RRF 融合精确匹配 / 关键词 / 向量三路结果，可选 Redis 缓存。"""
+"""混合检索：召回(精确编号 + 关键词 + 向量) → reranker 精排 → 带分数 TopK。
+
+设计要点：
+- 召回阶段不追求精度，追求覆盖：单路放大到 retrieval_recall_per_branch (默认 50)。
+- RfF 仅作为 reranker 不可用时的兜底融合。reranker 启用时直接把召回去重后整批喂进去。
+- 输出 HybridSearchResult：上层（rule_service / judge_agent）能拿到分数 + 重排状态，
+  从而判断 confidence_hint 与排序信号是否可信，避免"top1 不沾边就盲目重试"的循环。
+- query 自动扩展：关键词分支前用同义词字典做 OR 展开。
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Iterable, Protocol
 
 import redis.asyncio as aioredis
@@ -15,20 +24,53 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.models import RuleChunk
 from app.retrieval.embeddings import generate_embedding
+from app.retrieval.query_expand import expand_query
+from app.retrieval.reranker import (
+    RerankedChunk,
+    RerankStatus,
+    _fallback_items,
+    rerank,
+)
 from app.tools.rule_tools import search_by_keyword, search_by_section_id
 
 logger = get_logger(__name__)
 
-# RRF 单路最大候选数
-_RRF_PER_BRANCH = 30
-
 # embedding 列即使是向量检索也无需 SELECT 出来：ORDER BY 在 PG 端用就够了，
-# 否则单条 SELECT 会带回 30 行 × 1024 维 ≈ 600KB，到云端 PG 的网络往返让单条 SQL 跑 20+ 秒。
+# 否则单条 SELECT 会带回 30+ 行 × 1024 维 ≈ 600KB，到云端 PG 的网络往返让单条 SQL 跑 20+ 秒。
 _DEFER_EMBEDDING = (defer(RuleChunk.embedding),)
 
 
+@dataclass(frozen=True, slots=True)
+class HybridSearchResult:
+    """混合检索结果：TopK + 重排状态信号。
+
+    rerank_status 让 agent 把"分数信号是否可信"暴露给前端 trace，便于排查质量问题：
+    - ok       : 至少一次 reranker API 调用成功，分数可信
+    - cached   : 命中重排 LRU 或 Redis 检索缓存，分数仍来自真实重排
+    - fallback : reranker API 失败，走线性递减兜底，分数仅作排序占位
+    - disabled : reranker_enabled=False，主动关闭精排（也走兜底）
+    - no_input : 无候选 chunk
+    """
+
+    items: list[RerankedChunk]
+    rerank_status: RerankStatus
+
+    def __iter__(self):
+        return iter(self.items)
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int | slice):
+        return self.items[idx]
+
+
 class RuleSearcher(Protocol):
-    """规则检索协议。Agent / Service 依赖这个抽象，方便测试 mock。"""
+    """规则检索协议。Agent / Service 依赖这个抽象，方便测试 mock。
+
+    返回 HybridSearchResult：上层从 .items 拿带分数的 chunk，从 .rerank_status 判断
+    分数信号是否可信。
+    """
 
     async def search(
         self,
@@ -38,7 +80,7 @@ class RuleSearcher(Protocol):
         document_types: list[str] | None = None,
         top_k: int = 10,
         vector_query: str | None = None,
-    ) -> list[RuleChunk]:
+    ) -> HybridSearchResult:
         ...
 
 
@@ -56,6 +98,8 @@ def _cache_key(
             "dt": sorted(document_types) if document_types else None,
             "k": top_k,
             "vq": vector_query,
+            # reranker 配置变了缓存要失效（不同模型分数不可比）
+            "rk": settings.reranker_model if settings.reranker_enabled else "off",
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -70,7 +114,10 @@ def _rrf_fuse(
     top_k: int,
     k: int = 60,
 ) -> list[RuleChunk]:
-    """Reciprocal Rank Fusion：每路按排名贡献 1/(k + rank)，分数累加后取 top_k。"""
+    """Reciprocal Rank Fusion：每路按排名贡献 1/(k + rank)，分数累加后取 top_k。
+
+    仅在 reranker 不可用 / 关闭时作为兜底融合策略使用。
+    """
     scores: dict[int, float] = {}
     chunks_by_id: dict[int, RuleChunk] = {}
 
@@ -105,6 +152,44 @@ async def _vector_search(
     return list(result.scalars().all())
 
 
+async def _safe_db_branch(
+    db: AsyncSession,
+    branch_name: str,
+    coro_factory,
+) -> list[RuleChunk]:
+    """运行一个 SQL 检索分支，失败时回滚 session 并返回空。
+
+    asyncpg / SQLAlchemy 在 PG 上的语义：一旦某次查询抛异常，
+    连接进入 transaction-error 状态，**所有后续查询都会失败**直到 rollback。
+    FastAPI 一个请求共享一个 session，意味着 vector 分支挂了会让后续 keyword
+    检索甚至下一次 search_rules 工具调用全部连锁失败。
+
+    所以每个分支独立 try/except，PG 异常时主动 rollback 让 session 干净，
+    再返回空让上层继续走其他分支。SQLite 等其他方言无此连锁卡死问题，
+    rollback 失败也吞掉，避免测试环境的 greenlet 上下文问题。
+    """
+    try:
+        return await coro_factory()
+    except Exception as exc:
+        logger.warning(
+            f"{branch_name}失败，将尝试回滚 session",
+            error=str(exc)[:200],
+        )
+        # 仅 PG 真正需要 rollback 解卡；其他方言失败 rollback 自身可能抛
+        # MissingGreenlet 等无关异常，统一吞掉
+        dialect = db.bind.dialect.name if db.bind else ""
+        if dialect == "postgresql":
+            try:
+                await db.rollback()
+            except Exception as rb_exc:
+                logger.warning(
+                    "session rollback 失败",
+                    branch=branch_name,
+                    error=str(rb_exc)[:200],
+                )
+        return []
+
+
 async def hybrid_search(
     db: AsyncSession,
     query: str,
@@ -113,15 +198,18 @@ async def hybrid_search(
     top_k: int = 10,
     vector_query: str | None = None,
     redis: aioredis.Redis | None = None,
-) -> list[RuleChunk]:
-    """混合检索（RRF 融合）。
+) -> HybridSearchResult:
+    """混合召回 + 精排，返回带分数的 TopK 与重排状态。
 
-    - 精确规则号匹配：作为最高优先级单独前置（不参与 RRF），避免被向量分数压下去。
-    - 关键词 + 向量：跑满后 RRF 融合，去重后截断到 top_k。
-    - Redis 缓存：命中直接返回 chunk id 列表，再去 DB 取全行（避免缓存大文本）。
+    流程：
+        1) 精确规则号匹配 → 单独前置（不参与重排，保证用户明确指名的条目永远在前）
+        2) 关键词召回（query 自动同义词扩展）
+        3) 向量召回（vector_query → embedding → cosine 距离）
+        4) 去重合并 → reranker 精排 → 取 top_k
+        5) reranker 不可用时降级到 RRF 融合（status=fallback / disabled）
 
     Args:
-        query: 关键词检索用查询（LLM 提取的关键词）。
+        query: 关键词检索用查询（LLM 提取的关键词）。会被 expand_query 扩展。
         vector_query: 向量检索用查询（用户原始问题），未传则降级到 query。
         redis: 可选 Redis 客户端，用于缓存。
     """
@@ -129,74 +217,190 @@ async def hybrid_search(
     cache_key = _cache_key(query, section_id, document_types, top_k, vector_query) if cache_enabled else ""
 
     if cache_enabled:
-        try:
-            cached = await redis.get(cache_key)
-            if cached:
-                ids = json.loads(cached)
-                if ids:
-                    rows = await db.execute(
-                        select(RuleChunk).options(*_DEFER_EMBEDDING).where(RuleChunk.id.in_(ids))
-                    )
-                    by_id = {r.id: r for r in rows.scalars().all()}
-                    ordered = [by_id[i] for i in ids if i in by_id]
-                    if ordered:
-                        logger.info("规则检索缓存命中", key=cache_key, count=len(ordered))
-                        return ordered
-        except Exception:
-            logger.warning("Redis 检索缓存读取失败")
+        cached = await _read_cache(redis, cache_key, db)
+        if cached is not None:
+            logger.info("规则检索缓存命中", key=cache_key, count=len(cached))
+            # 命中检索缓存意味着上次结果（分数）来自当时的真实重排，标记为 cached
+            return HybridSearchResult(items=cached, rerank_status="cached")
 
-    results: list[RuleChunk] = []
-
-    # 1) 精确规则号 → 直接前置
+    # ---- 1) 精确编号前置 ----
     exact: list[RuleChunk] = []
     if section_id:
-        exact = await search_by_section_id(db, section_id, document_types)
+        exact = await _safe_db_branch(
+            db,
+            "精确匹配",
+            lambda: search_by_section_id(db, section_id, document_types),
+        )
         logger.info("精确匹配", section_id=section_id, count=len(exact))
-        results.extend(exact)
 
-    # 2) 关键词 + 向量，RRF 融合剩余位置
-    remaining = top_k - len(results)
-    if remaining > 0:
-        keyword_branch: list[RuleChunk] = []
-        if query:
-            keyword_branch = await search_by_keyword(db, query, document_types, limit=_RRF_PER_BRANCH)
-            logger.info("关键词检索", query=query[:50], count=len(keyword_branch))
+    # ---- 2) 关键词召回（带同义词扩展） ----
+    expansion = expand_query(query) if query else None
+    keyword_branch: list[RuleChunk] = []
+    expanded_keywords = ""
+    if expansion and expansion.keywords:
+        expanded_keywords = " ".join(expansion.keywords)
+        keyword_branch = await _safe_db_branch(
+            db,
+            "关键词检索",
+            lambda: search_by_keyword(
+                db,
+                expanded_keywords,
+                document_types,
+                limit=settings.retrieval_recall_per_branch,
+            ),
+        )
+        logger.info(
+            "关键词检索",
+            query=query[:50],
+            expanded=expanded_keywords[:80],
+            hit_groups=len(expansion.hit_groups),
+            count=len(keyword_branch),
+        )
 
-        vector_branch: list[RuleChunk] = []
-        vq = vector_query or query
-        if vq:
-            try:
-                emb = await generate_embedding(vq)
-                vector_branch = await _vector_search(db, emb, document_types, top_k=_RRF_PER_BRANCH)
-                logger.info("向量检索", query=vq[:50], count=len(vector_branch))
-            except Exception:
-                logger.warning("向量检索跳过（embedding 服务不可用或无数据）")
+    # ---- 3) 向量召回 ----
+    # 拆成两段：embedding（外部 HTTP）失败不该污染 DB session；
+    # _vector_search（DB SQL）失败要走 _safe_db_branch 回滚。
+    vector_branch: list[RuleChunk] = []
+    vq = vector_query or query
+    if vq:
+        emb: list[float] | None = None
+        try:
+            emb = await generate_embedding(vq)
+        except Exception:
+            logger.warning("embedding 生成失败，跳过向量分支")
+        if emb is not None:
+            vector_branch = await _safe_db_branch(
+                db,
+                "向量检索",
+                lambda: _vector_search(
+                    db, emb, document_types, top_k=settings.retrieval_recall_per_branch
+                ),
+            )
+            logger.info("向量检索", query=vq[:50], count=len(vector_branch))
 
+    # ---- 4) 合并去重 ----
+    candidates: list[RuleChunk] = []
+    seen: set[int] = set()
+    for c in exact:
+        if c.id is not None and c.id not in seen:
+            candidates.append(c)
+            seen.add(c.id)
+    fallback_id_counter = -1
+    for c in keyword_branch + vector_branch:
+        cid = c.id if c.id is not None else fallback_id_counter
+        if c.id is None:
+            fallback_id_counter -= 1
+        if cid in seen:
+            continue
+        candidates.append(c)
+        seen.add(cid)
+
+    if not candidates:
+        if cache_enabled:
+            await _write_cache(redis, cache_key, [])
+        return HybridSearchResult(items=[], rerank_status="no_input")
+
+    # ---- 5) Reranker 精排 ----
+    rerank_query = vq or query or ""
+    status: RerankStatus
+    if settings.reranker_enabled and rerank_query:
+        rerank_result = await rerank(rerank_query, candidates, top_k=None)
+        ranked = list(rerank_result.items)
+        status = rerank_result.status
+    else:
+        # reranker 关闭：用 RRF 融合 keyword + vector 分支，exact 已经在 candidates 头部
         fused = _rrf_fuse(
             [keyword_branch, vector_branch],
-            top_k=remaining + len(exact),  # 多取一点以防与 exact 去重后不够
+            top_k=settings.retrieval_recall_per_branch,
             k=settings.retrieval_rrf_k,
         )
-        # 去重：已经在 exact 里的不再加入
-        seen = {c.id for c in results}
-        for chunk in fused:
-            if chunk.id in seen:
-                continue
-            results.append(chunk)
-            seen.add(chunk.id)
-            if len(results) >= top_k:
-                break
+        ordered: list[RuleChunk] = list(exact)
+        ordered_ids = {c.id for c in ordered if c.id is not None}
+        for c in fused:
+            if c.id not in ordered_ids:
+                ordered.append(c)
+                ordered_ids.add(c.id)
+        ranked = _fallback_items(ordered, top_k=None)
+        status = "disabled"
 
-    final = results[:top_k]
+    # exact 永远在前：reranker 给的分数可能让其他条目排在 exact 前面，
+    # 但用户明确报了 section_id 时这是反直觉的。把 exact 的 chunk 提到最前。
+    if exact:
+        exact_ids = {c.id for c in exact if c.id is not None}
+        exact_ranked = [r for r in ranked if r.chunk.id in exact_ids]
+        rest_ranked = [r for r in ranked if r.chunk.id not in exact_ids]
+        ranked = exact_ranked + rest_ranked
+
+    final = ranked[:top_k]
 
     if cache_enabled and final:
-        try:
-            ids = [c.id for c in final if c.id is not None]
-            await redis.set(cache_key, json.dumps(ids), ex=settings.retrieval_cache_ttl)
-        except Exception:
-            logger.warning("Redis 检索缓存写入失败")
+        await _write_cache(redis, cache_key, final)
 
-    return final
+    return HybridSearchResult(items=final, rerank_status=status)
+
+
+async def _read_cache(
+    redis: aioredis.Redis,
+    cache_key: str,
+    db: AsyncSession,
+) -> list[RerankedChunk] | None:
+    """从 Redis 读 (chunk_id, score) 列表，再从 DB 取全行。"""
+    try:
+        cached = await redis.get(cache_key)
+        if not cached:
+            return None
+        payload = json.loads(cached)
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not items:
+            return None
+        ids = [int(it["id"]) for it in items if "id" in it]
+        if not ids:
+            return None
+    except Exception:
+        logger.warning("Redis 检索缓存读取失败")
+        return None
+
+    # DB 查询单独保护：失败时 rollback 让 session 干净，避免污染后续分支
+    try:
+        rows = await db.execute(
+            select(RuleChunk).options(*_DEFER_EMBEDDING).where(RuleChunk.id.in_(ids))
+        )
+        by_id = {r.id: r for r in rows.scalars().all()}
+    except Exception as exc:
+        logger.warning("缓存命中后 DB 取行失败，已回滚 session", error=str(exc)[:200])
+        dialect = db.bind.dialect.name if db.bind else ""
+        if dialect == "postgresql":
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+        return None
+
+    ordered: list[RerankedChunk] = []
+    for it in items:
+        cid = int(it.get("id", -1))
+        chunk = by_id.get(cid)
+        if chunk is not None:
+            ordered.append(RerankedChunk(chunk=chunk, score=float(it.get("s", 0.0))))
+    return ordered or None
+
+
+async def _write_cache(
+    redis: aioredis.Redis,
+    cache_key: str,
+    final: list[RerankedChunk],
+) -> None:
+    try:
+        payload = {
+            "items": [
+                {"id": r.chunk.id, "s": round(r.score, 4)}
+                for r in final
+                if r.chunk.id is not None
+            ]
+        }
+        await redis.set(cache_key, json.dumps(payload), ex=settings.retrieval_cache_ttl)
+    except Exception:
+        logger.warning("Redis 检索缓存写入失败")
 
 
 class DefaultRuleSearcher:
@@ -214,7 +418,7 @@ class DefaultRuleSearcher:
         document_types: list[str] | None = None,
         top_k: int = 10,
         vector_query: str | None = None,
-    ) -> list[RuleChunk]:
+    ) -> HybridSearchResult:
         return await hybrid_search(
             self.db,
             query=query,

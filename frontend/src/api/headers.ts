@@ -7,6 +7,9 @@ export function byokHeaders(llm: LLMOverride | undefined): Record<string, string
   if (llm.apiKey?.trim()) h['X-LLM-Api-Key'] = llm.apiKey.trim()
   if (llm.baseUrl?.trim()) h['X-LLM-Base-URL'] = llm.baseUrl.trim()
   if (llm.model?.trim()) h['X-LLM-Model'] = llm.model.trim()
+  if (typeof llm.maxTokens === 'number' && Number.isFinite(llm.maxTokens) && llm.maxTokens > 0) {
+    h['X-LLM-Max-Tokens'] = String(Math.floor(llm.maxTokens))
+  }
   return h
 }
 

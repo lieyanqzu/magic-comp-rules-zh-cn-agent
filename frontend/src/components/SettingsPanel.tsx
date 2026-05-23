@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { AppSettings } from '../api/types'
+import { DEFAULT_MAX_TOKENS } from '../hooks/useSettings'
 
 interface SettingsPanelProps {
   settings: AppSettings
@@ -88,6 +89,11 @@ export function SettingsPanel({ settings, onUpdate, onUpdateLlm, onReset }: Sett
             <span className="ml-2 text-xs text-slate-500 dark:text-slate-400">实时显示推理过程</span>
           </span>
         </label>
+
+        <MaxTokensField
+          value={settings.llm.maxTokens}
+          onChange={(v) => onUpdateLlm({ maxTokens: v })}
+        />
       </Section>
 
       <Section title="后端鉴权" hint="服务器开启 API_KEY 时必填">
@@ -205,6 +211,50 @@ interface ModelFieldProps {
   apiKey: string
   value: string
   onChange: (v: string) => void
+}
+
+function MaxTokensField({
+  value,
+  onChange,
+}: {
+  value: number | undefined
+  onChange: (v: number | undefined) => void
+}) {
+  // value=undefined 表示用默认。input 显示空字符串。
+  // 输入合法整数则上行 number；清空则上行 undefined（让后端走默认 32K）
+  const display = value == null ? '' : String(value)
+  const handleChange = (raw: string) => {
+    const trimmed = raw.trim()
+    if (trimmed === '') {
+      onChange(undefined)
+      return
+    }
+    const n = Number.parseInt(trimmed, 10)
+    if (Number.isFinite(n) && n > 0) onChange(n)
+  }
+  return (
+    <label className="block">
+      <span className="mb-1 flex items-center justify-between text-xs font-medium text-slate-700 dark:text-slate-300">
+        <span>响应最大 token 数</span>
+        <span className="font-normal text-slate-500 dark:text-slate-400">
+          默认 {DEFAULT_MAX_TOKENS.toLocaleString()}
+        </span>
+      </span>
+      <input
+        type="number"
+        min={1}
+        step={1000}
+        inputMode="numeric"
+        value={display}
+        onChange={(e) => handleChange(e.target.value)}
+        placeholder={`${DEFAULT_MAX_TOKENS}（留空使用默认）`}
+        className="w-full rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 focus:outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-indigo-500 dark:focus:ring-indigo-900/40"
+      />
+      <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+        长答案被截断时调高；上游有自己的硬上限（通常 8K-128K），过大会被 provider 拒绝。
+      </p>
+    </label>
+  )
 }
 
 function ModelField({ baseUrl, apiKey, value, onChange }: ModelFieldProps) {
