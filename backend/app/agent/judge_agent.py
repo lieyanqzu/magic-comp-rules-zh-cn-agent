@@ -153,7 +153,7 @@ def _extract_json(raw: str) -> str:
     仍会返回 markdown 围栏或前后多余文字。剥掉常见包装后再交给 json.loads，
     解析成功率比 strict 模式高一截，且不会误改本身合法的 JSON。
     """
-    s = raw.strip()
+    s = _strip_provider_template_tokens(raw).strip()
     # 去掉 ```json ... ``` 或 ``` ... ``` 围栏
     if s.startswith("```"):
         s = s[3:]
@@ -168,6 +168,18 @@ def _extract_json(raw: str) -> str:
     if start != -1 and end != -1 and end > start:
         return s[start : end + 1]
     return s
+
+
+# 已知 provider 在 force_no_tools 收尾轮会把内部工具调用模板 token 漏到 content 字段，
+# 例如 DeepSeek V4 的 <｜DSML｜tool_calls> / <｜DSML｜invoke> / <｜DSML｜parameter> 系列。
+# 这些 token 用全角竖线 U+FF5C 包裹（与普通 < > 不冲突），统一在解析前剥掉。
+_PROVIDER_TEMPLATE_TOKEN_RE = re.compile(r"<\s*/?\s*｜[^>]{0,200}?｜[^>]{0,40}?>")
+
+
+def _strip_provider_template_tokens(raw: str) -> str:
+    if not raw or "｜" not in raw:
+        return raw
+    return _PROVIDER_TEMPLATE_TOKEN_RE.sub("", raw)
 
 
 # 哪些异常需要重试（瞬时错误）
@@ -245,6 +257,42 @@ class JudgeAgent:
         norm_dt = ",".join(sorted(doc_types)) if doc_types else ""
         return norm_query, norm_sid, norm_dt
 
+    # rerank_query 总长上限（字符）。reranker 模型通常 512~1024 token，保守估计 1 字 ≈ 1.5 token，
+    # 600 字符够装"用户原句 + 2~3 张牌的 oracle 文本"，再多收益递减还会拖慢精排。
+    _RERANK_QUERY_MAX_LEN: int = 600
+
+    @staticmethod
+    def _build_rerank_query(question: str, cards: list[dict]) -> str | None:
+        """拼装喂给 cross-encoder 的 query。
+
+        策略：用户原句 + 已 resolve 牌张的 oracle 文本（中文优先，缺则英文）。原因：
+        - 用户原句口语化、含俗称/牌名，与规则条文措辞距离远，单独使用 reranker 分数会塌缩。
+        - 而牌张 oracle 文本与规则条文是同一套术语体系，cross-encoder 能直接做同义匹配，
+          不需要 LLM 临场蒸馏关键词。
+
+        必须至少拼到一张牌的 oracle 文本才返回；否则返回 None，
+        让下游回退到 query / vector_query 默认链路（不要把光秃秃的用户原句喂给 reranker）。
+        """
+        oracle_parts: list[str] = []
+        for card in cards or []:
+            text = (card.get("translated_text") or card.get("oracle_text") or "").strip()
+            if not text:
+                continue
+            name = (card.get("name") or card.get("oracle_name") or "").strip()
+            oracle_parts.append(f"{name}：{text}" if name else text)
+        if not oracle_parts:
+            return None
+
+        parts: list[str] = []
+        q = (question or "").strip()
+        if q:
+            parts.append(q)
+        parts.extend(oracle_parts)
+        merged = " | ".join(parts)
+        if len(merged) > JudgeAgent._RERANK_QUERY_MAX_LEN:
+            merged = merged[: JudgeAgent._RERANK_QUERY_MAX_LEN]
+        return merged
+
     async def _llm_call(self, *, messages: list, tools: list | None = None, force_no_tools: bool = False):
         """LLM 调用 + tenacity 指数退避重试。
 
@@ -296,12 +344,21 @@ class JudgeAgent:
         raise LLMError("LLM 调用未返回响应")
 
     async def _execute_tool(
-        self, name: str, arguments: dict, original_question: str = "", *, rounds_left: int = 0
+        self,
+        name: str,
+        arguments: dict,
+        original_question: str = "",
+        *,
+        rounds_left: int = 0,
+        collected_cards: list[dict] | None = None,
     ) -> tuple[str, dict | None]:
         """执行工具，返回 (原始结果字符串, 额外元数据)。
 
         rounds_left: 当前 tool_call 完成后 LLM 还能调几次工具（不含本次）。
             会被注入到 search_rules 的返回里，让 LLM 据此判断是否继续检索。
+        collected_cards: 本次对话已 resolve 出来的牌张元数据。喂给 search_rules 时，
+            会把牌张 oracle 文本拼进 reranker 的 query，让 cross-encoder 直接做"牌面文本 ↔
+            规则条文"的同义匹配，比依赖 LLM 蒸馏关键词稳得多。
         """
         if name == "resolve_card":
             card_name = arguments.get("card_name", "")
@@ -327,7 +384,10 @@ class JudgeAgent:
             return json.dumps({"found": False, "name": card_name}, ensure_ascii=False), None
         if name == "search_rules":
             return await self._execute_search_rules(
-                arguments, original_question=original_question, rounds_left=rounds_left
+                arguments,
+                original_question=original_question,
+                rounds_left=rounds_left,
+                collected_cards=collected_cards or [],
             )
         if name == "search_cards":
             query = arguments.get("query", "")
@@ -343,6 +403,7 @@ class JudgeAgent:
         *,
         original_question: str,
         rounds_left: int,
+        collected_cards: list[dict],
     ) -> tuple[str, dict | None]:
         """search_rules 工具实现：召回 + 重排 + 预算/置信度元信息。
 
@@ -413,6 +474,7 @@ class JudgeAgent:
             document_types=doc_types,
             top_k=10,
             vector_query=original_question,
+            rerank_query=self._build_rerank_query(original_question, collected_cards),
         )
         # 兼容 mock：测试里的 mock 直接返回 list[RerankedChunk]
         rerank_status = getattr(ranked, "rerank_status", "ok")
@@ -688,6 +750,7 @@ class JudgeAgent:
                         func_args,
                         original_question=question,
                         rounds_left=rounds_left_after_this,
+                        collected_cards=collected_cards,
                     )
                 except Exception as e:
                     logger.warning(
@@ -856,8 +919,11 @@ class JudgeAgent:
         if not broken_raw or not broken_raw.strip():
             return None
 
-        # 去掉外层 markdown 围栏（最常见的 ```json ... ```）
-        text = broken_raw.strip()
+        # 先剥掉 provider 内部模板 token（DeepSeek V4 的 DSML 系列等），
+        # 否则后面的 answer 正则会把这堆 token 当成正文挖出来。
+        text = _strip_provider_template_tokens(broken_raw).strip()
+        if not text:
+            return None
         if text.startswith("```"):
             text = text[3:]
             if text[:4].lower() == "json":

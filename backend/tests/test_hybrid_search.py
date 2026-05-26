@@ -138,3 +138,36 @@ async def test_safe_db_branch_isolates_failure(db) -> None:
     result2 = await hybrid_search(db, query="完全不相关 xyz", top_k=5)
     assert hasattr(result2, "rerank_status")
 
+
+@pytest.mark.asyncio
+async def test_hybrid_search_passes_rerank_query_to_reranker(db, monkeypatch) -> None:
+    """rerank_query 参数应原样喂给 reranker（cross-encoder 输入），不会被覆盖成 query 或 vector_query。
+
+    Agent 路径的核心契约：上层拼装好"用户原句 + 牌张 oracle"作为 rerank_query 时，
+    reranker 看到的就是这个拼接结果，而不是 LLM 蒸馏的精炼词或裸用户原句。
+    """
+    from app.core.config import settings as cfg
+    from app.retrieval import hybrid_search as hs_mod
+
+    monkeypatch.setattr(cfg, "reranker_enabled", True)
+    db.add(_chunk(40, section_id="613.1f", title="层 6", content="层 6 内容"))
+    await db.commit()
+
+    captured: dict = {}
+
+    async def fake_rerank(query, candidates, *, top_k=None):
+        captured["query"] = query
+        from app.retrieval.reranker import RerankResult, _fallback_items
+        return RerankResult(items=_fallback_items(candidates, top_k), status="ok")
+
+    monkeypatch.setattr(hs_mod, "rerank", fake_rerank)
+
+    await hybrid_search(
+        db,
+        query="层 6",
+        vector_query="层和持续效应的关系是？",
+        rerank_query="谦卑：所有生物失去所有异能",
+        top_k=5,
+    )
+    assert captured["query"] == "谦卑：所有生物失去所有异能"
+

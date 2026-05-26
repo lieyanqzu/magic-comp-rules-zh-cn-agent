@@ -238,3 +238,120 @@ async def test_parse_response_accepts_summary_only_response() -> None:
     assert parsed.summary == "先攻先打死触"
     assert parsed.confidence == "high"
 
+
+# ---- rerank_query 注入：让 cross-encoder 拿到牌张 oracle 文本而非 LLM 蒸馏关键词 ----
+
+
+def test_build_rerank_query_with_cards_includes_oracle_text() -> None:
+    """已 resolve 的牌张 oracle 文本应被拼进 rerank query，作为 cross-encoder 的同义信号。"""
+    cards = [
+        {
+            "name": "谦卑",
+            "oracle_name": "Humility",
+            "translated_text": "所有生物失去所有异能，且基础力量与防御力为1/1。",
+            "oracle_text": "All creatures lose all abilities and have base power and toughness 1/1.",
+        }
+    ]
+    rq = JudgeAgent._build_rerank_query("谦卑和库多怎么交互？", cards)
+    assert rq is not None
+    assert "失去所有异能" in rq
+    # 用户原句也保留，提供语义上下文
+    assert "谦卑和库多怎么交互" in rq
+
+
+def test_build_rerank_query_prefers_chinese_oracle() -> None:
+    """中英文都有时优先用中文，中文规则库的 chunk 是中文，匹配更准。"""
+    cards = [{
+        "name": "谦卑",
+        "translated_text": "中文 oracle",
+        "oracle_text": "english oracle",
+    }]
+    rq = JudgeAgent._build_rerank_query("Q", cards)
+    assert rq is not None and "中文 oracle" in rq and "english oracle" not in rq
+
+
+def test_build_rerank_query_falls_back_to_english() -> None:
+    """中文 oracle 缺失时回退到英文，不应丢失信号。"""
+    cards = [{"name": "X", "translated_text": "", "oracle_text": "english only"}]
+    rq = JudgeAgent._build_rerank_query("Q", cards)
+    assert rq is not None and "english only" in rq
+
+
+def test_build_rerank_query_returns_none_without_cards() -> None:
+    """没解析到牌时返回 None，让下游回退到 query / vector_query 默认链路。"""
+    assert JudgeAgent._build_rerank_query("纯规则问题", []) is None
+    assert JudgeAgent._build_rerank_query("纯规则问题", [{"name": "X"}]) is None  # 无 oracle 文本
+
+
+def test_build_rerank_query_truncates_to_limit() -> None:
+    """oracle 文本可能很长，拼接后必须截到 _RERANK_QUERY_MAX_LEN 以内，避免拖慢精排。"""
+    cards = [{"name": "Big", "translated_text": "啊" * 10_000}]
+    rq = JudgeAgent._build_rerank_query("Q", cards)
+    assert rq is not None
+    assert len(rq) <= JudgeAgent._RERANK_QUERY_MAX_LEN
+
+
+@pytest.mark.asyncio
+async def test_search_rules_passes_rerank_query_with_collected_cards() -> None:
+    """_execute_tool 应把 collected_cards 拼装后通过 rerank_query 传给 searcher。"""
+    agent = _make_agent([_ranked(1, "613.1f", "层 6 移除异能", 0.9)])
+    cards = [{
+        "name": "谦卑",
+        "translated_text": "所有生物失去所有异能，且基础力量与防御力为1/1。",
+    }]
+    await agent._execute_tool(
+        "search_rules",
+        {"query": "层 6 失去 异能"},
+        original_question="谦卑和库多怎么交互？",
+        rounds_left=3,
+        collected_cards=cards,
+    )
+    kwargs = agent.searcher.search.call_args.kwargs
+    assert kwargs["rerank_query"] is not None
+    assert "失去所有异能" in kwargs["rerank_query"]
+    assert kwargs["query"] == "层 6 失去 异能"  # query 仍传入，作为关键词召回信号
+
+
+@pytest.mark.asyncio
+async def test_search_rules_omits_rerank_query_without_cards() -> None:
+    """裸规则问题（没解析到牌）时 rerank_query 为 None，让 hybrid_search 走默认链路。"""
+    agent = _make_agent([_ranked(1, "100.1", "内容", 0.6)])
+    await agent._execute_tool(
+        "search_rules",
+        {"query": "层"},
+        original_question="层系统怎么应用？",
+        rounds_left=3,
+        collected_cards=[],
+    )
+    kwargs = agent.searcher.search.call_args.kwargs
+    assert kwargs["rerank_query"] is None
+
+
+# ---- DeepSeek V4 内部模板 token 污染抢救 ----
+
+
+@pytest.mark.asyncio
+async def test_salvage_strips_deepseek_dsml_tokens() -> None:
+    """DeepSeek V4 在 force_no_tools 收尾轮可能把 <｜DSML｜tool_calls> 等模板 token
+    漏到 content 里。salvage 必须先剥掉它们，否则 answer 会变成一坨 token 字符串。"""
+    from app.agent.judge_agent import _strip_provider_template_tokens
+    polluted = (
+        '["cr","reference"]</｜｜DSML｜｜parameter>\n'
+        '</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>'
+    )
+    cleaned = _strip_provider_template_tokens(polluted)
+    assert "DSML" not in cleaned
+    assert "｜" not in cleaned
+
+    agent = _make_agent([])
+    parsed = await agent._parse_response_with_repair(polluted, [], [], [])
+    # 剥掉 token 后没有可救的字段，进入兜底；answer 不应再含 DSML 字样
+    assert "DSML" not in parsed.answer
+
+
+def test_strip_provider_template_tokens_keeps_normal_html_like_text() -> None:
+    """普通 HTML / 角括号文本（不含全角竖线）不应被误删。"""
+    from app.agent.judge_agent import _strip_provider_template_tokens
+    text = "答：<b>层 7b</b> 中 P/T 设定生效。"
+    assert _strip_provider_template_tokens(text) == text
+

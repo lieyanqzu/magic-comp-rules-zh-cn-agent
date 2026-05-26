@@ -80,6 +80,7 @@ class RuleSearcher(Protocol):
         document_types: list[str] | None = None,
         top_k: int = 10,
         vector_query: str | None = None,
+        rerank_query: str | None = None,
     ) -> HybridSearchResult:
         ...
 
@@ -90,6 +91,7 @@ def _cache_key(
     document_types: list[str] | None,
     top_k: int,
     vector_query: str | None,
+    rerank_query: str | None,
 ) -> str:
     payload = json.dumps(
         {
@@ -98,6 +100,8 @@ def _cache_key(
             "dt": sorted(document_types) if document_types else None,
             "k": top_k,
             "vq": vector_query,
+            # rerank_query 改变时分数与排序都会变，必须并入 key
+            "rq": rerank_query,
             # reranker 配置变了缓存要失效（不同模型分数不可比）
             "rk": settings.reranker_model if settings.reranker_enabled else "off",
         },
@@ -197,6 +201,7 @@ async def hybrid_search(
     document_types: list[str] | None = None,
     top_k: int = 10,
     vector_query: str | None = None,
+    rerank_query: str | None = None,
     redis: aioredis.Redis | None = None,
 ) -> HybridSearchResult:
     """混合召回 + 精排，返回带分数的 TopK 与重排状态。
@@ -210,11 +215,18 @@ async def hybrid_search(
 
     Args:
         query: 关键词检索用查询（LLM 提取的关键词）。会被 expand_query 扩展。
-        vector_query: 向量检索用查询（用户原始问题），未传则降级到 query。
+        vector_query: 向量召回用查询（用户原始问题），未传则降级到 query。
+        rerank_query: 精排阶段喂给 cross-encoder 的查询。Agent 可以传入"用户问题 + 已解析牌张
+            oracle 文本"等更接近规则条文措辞的拼接，让 reranker 直接做同义匹配，不依赖 LLM
+            蒸馏关键词的能力。未传则按 query → vector_query 顺序回退。
         redis: 可选 Redis 客户端，用于缓存。
     """
     cache_enabled = settings.retrieval_cache_enabled and redis is not None
-    cache_key = _cache_key(query, section_id, document_types, top_k, vector_query) if cache_enabled else ""
+    cache_key = (
+        _cache_key(query, section_id, document_types, top_k, vector_query, rerank_query)
+        if cache_enabled
+        else ""
+    )
 
     if cache_enabled:
         cached = await _read_cache(redis, cache_key, db)
@@ -301,10 +313,15 @@ async def hybrid_search(
         return HybridSearchResult(items=[], rerank_status="no_input")
 
     # ---- 5) Reranker 精排 ----
-    rerank_query = vq or query or ""
+    # rerank_query 选择策略：
+    # - 调用方传入的 rerank_query 优先（一般是 user question + 已 resolve 牌张的 oracle 文本拼接，
+    #   能让 cross-encoder 直接与规则条文做同义匹配，不依赖 LLM 临场蒸馏关键词的能力）。
+    # - 否则回退到 query（LLM 蒸馏的精炼词，关键词召回也用它）。
+    # - 最后才是 vector_query（用户原句）；裸原句往往含口语/牌名噪声，是最弱信号。
+    rq = rerank_query or query or vq or ""
     status: RerankStatus
-    if settings.reranker_enabled and rerank_query:
-        rerank_result = await rerank(rerank_query, candidates, top_k=None)
+    if settings.reranker_enabled and rq:
+        rerank_result = await rerank(rq, candidates, top_k=None)
         ranked = list(rerank_result.items)
         status = rerank_result.status
     else:
@@ -418,6 +435,7 @@ class DefaultRuleSearcher:
         document_types: list[str] | None = None,
         top_k: int = 10,
         vector_query: str | None = None,
+        rerank_query: str | None = None,
     ) -> HybridSearchResult:
         return await hybrid_search(
             self.db,
@@ -426,5 +444,6 @@ class DefaultRuleSearcher:
             document_types=document_types,
             top_k=top_k,
             vector_query=vector_query,
+            rerank_query=rerank_query,
             redis=self.redis,
         )

@@ -45,17 +45,53 @@ async def _get(url: str, params: dict | None = None) -> dict | list | None:
 
 
 async def search_mtgch(name: str) -> dict | None:
-    """通过 mtgch 搜索 API 查牌。"""
+    """通过 mtgch 搜索 API 查牌。
+
+    匹配优先级（避免短牌名被长牌名 substring 抢走）：
+    1) 任一名字字段精确等于输入（中英文都比较，英文做 lowercase 归一化）
+    2) 双向 substring 容错——输入是结果的子串，或反之
+    3) API 默认排序的 items[0]
+
+    旧实现只有 (2)+(3)，导致「谦卑」会先命中「谦卑皈宗者」（substring 匹配）
+    而不是同名结界 Humility。
+    """
     data = await _get(f"{settings.mtgch_api_url}/result", {"q": name, "page": 1})
     if not data or not isinstance(data, dict):
         return None
     items = data.get("items", [])
     if not items:
         return None
+
+    target = name.strip()
+    target_lower = target.lower()
+
+    def _candidate_names(item: dict) -> list[str]:
+        # mtgch 返回多个名字字段，覆盖率不一致：
+        # - zhs_name: 主中文名，但部分较老的牌为 None（如 Humility）
+        # - atomic_official_name: 官方中文译名，覆盖更全
+        # - atomic_translated_name: 社区中文译名（常与 official 同）
+        # - face_name / name: 双面牌的面名 / 英文牌名
+        return [
+            (item.get(f) or "")
+            for f in (
+                "zhs_name",
+                "atomic_official_name",
+                "atomic_translated_name",
+                "face_name",
+                "name",
+            )
+        ]
+
     for item in items:
-        item_name = item.get("zhs_name") or item.get("atomic_translated_name") or item.get("face_name") or ""
-        if name in item_name or item_name in name:
-            return item
+        for n in _candidate_names(item):
+            if n and (n == target or n.lower() == target_lower):
+                return item
+
+    for item in items:
+        for n in _candidate_names(item):
+            if n and (target in n or n in target):
+                return item
+
     return items[0]
 
 
